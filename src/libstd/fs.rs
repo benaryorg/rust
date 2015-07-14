@@ -1258,9 +1258,9 @@ impl DirBuilder {
         }
     }
 
-    /// Indicate that directories create should be created recursively, creating
-    /// all parent directories if they do not exist with the same security and
-    /// permissions settings.
+    /// Indicate that directories created should be created recursively,
+    /// creating all parent directories if they do not exist with the same
+    /// security and permissions settings.
     ///
     /// This option defaults to `false`
     pub fn recursive(&mut self, recursive: bool) -> &mut Self {
