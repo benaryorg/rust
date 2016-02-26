@@ -8,12 +8,12 @@
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
 
+// ignore-emscripten no threads support
+
 // This test may not always fail, but it can be flaky if the race it used to
 // expose is still present.
 
-// pretty-expanded FIXME #23616
-
-#![feature(std_misc)]
+#![feature(mpsc_select)]
 
 use std::sync::mpsc::{channel, Sender, Receiver};
 use std::thread;

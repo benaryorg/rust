@@ -20,8 +20,9 @@ use trans::expr;
 use trans::type_of;
 use trans::type_::Type;
 
-use syntax::ast;
+use rustc_front::hir as ast;
 use std::ffi::CString;
+use syntax::ast::AsmDialect;
 use libc::{c_uint, c_char};
 
 // Take an inline assembly expression and splat it out via LLVM
@@ -38,40 +39,51 @@ pub fn trans_inline_asm<'blk, 'tcx>(bcx: Block<'blk, 'tcx>, ia: &ast::InlineAsm)
     let mut ext_constraints = Vec::new();
 
     // Prepare the output operands
-    let outputs = ia.outputs.iter().enumerate().map(|(i, &(ref c, ref out, is_rw))| {
-        constraints.push((*c).clone());
+    let mut outputs = Vec::new();
+    let mut inputs = Vec::new();
+    for (i, out) in ia.outputs.iter().enumerate() {
+        constraints.push(out.constraint.clone());
 
-        let out_datum = unpack_datum!(bcx, expr::trans(bcx, &**out));
-        output_types.push(type_of::type_of(bcx.ccx(), out_datum.ty));
-        let val = out_datum.val;
-        if is_rw {
-            ext_inputs.push(unpack_result!(bcx, {
-                callee::trans_arg_datum(bcx,
-                                       expr_ty(bcx, &**out),
-                                       out_datum,
-                                       cleanup::CustomScope(temp_scope),
-                                       callee::DontAutorefArg)
-            }));
-            ext_constraints.push(i.to_string());
+        let out_datum = unpack_datum!(bcx, expr::trans(bcx, &out.expr));
+        if out.is_indirect {
+            bcx = callee::trans_arg_datum(bcx,
+                                          expr_ty(bcx, &out.expr),
+                                          out_datum,
+                                          cleanup::CustomScope(temp_scope),
+                                          callee::DontAutorefArg,
+                                          &mut inputs);
+            if out.is_rw {
+                ext_inputs.push(*inputs.last().unwrap());
+                ext_constraints.push(i.to_string());
+            }
+        } else {
+            output_types.push(type_of::type_of(bcx.ccx(), out_datum.ty));
+            outputs.push(out_datum.val);
+            if out.is_rw {
+                bcx = callee::trans_arg_datum(bcx,
+                                              expr_ty(bcx, &out.expr),
+                                              out_datum,
+                                              cleanup::CustomScope(temp_scope),
+                                              callee::DontAutorefArg,
+                                              &mut ext_inputs);
+                ext_constraints.push(i.to_string());
+            }
         }
-        val
-
-    }).collect::<Vec<_>>();
+    }
 
     // Now the input operands
-    let mut inputs = ia.inputs.iter().map(|&(ref c, ref input)| {
+    for &(ref c, ref input) in &ia.inputs {
         constraints.push((*c).clone());
 
-        let in_datum = unpack_datum!(bcx, expr::trans(bcx, &**input));
-        unpack_result!(bcx, {
-            callee::trans_arg_datum(bcx,
-                                    expr_ty(bcx, &**input),
+        let in_datum = unpack_datum!(bcx, expr::trans(bcx, &input));
+        bcx = callee::trans_arg_datum(bcx,
+                                    expr_ty(bcx, &input),
                                     in_datum,
                                     cleanup::CustomScope(temp_scope),
-                                    callee::DontAutorefArg)
-        })
-    }).collect::<Vec<_>>();
-    inputs.push_all(&ext_inputs[..]);
+                                    callee::DontAutorefArg,
+                                    &mut inputs);
+    }
+    inputs.extend_from_slice(&ext_inputs[..]);
 
     // no failure occurred preparing operands, no need to cleanup
     fcx.pop_custom_cleanup_scope(temp_scope);
@@ -88,12 +100,12 @@ pub fn trans_inline_asm<'blk, 'tcx>(bcx: Block<'blk, 'tcx>, ia: &ast::InlineAsm)
 
     let all_constraints= constraints.iter()
                                     .map(|s| s.to_string())
-                                    .chain(ext_constraints.into_iter())
+                                    .chain(ext_constraints)
                                     .chain(clobbers)
                                     .chain(arch_clobbers.iter()
                                                .map(|s| s.to_string()))
                                     .collect::<Vec<String>>()
-                                    .connect(",");
+                                    .join(",");
 
     debug!("Asm Constraints: {}", &all_constraints[..]);
 
@@ -106,8 +118,8 @@ pub fn trans_inline_asm<'blk, 'tcx>(bcx: Block<'blk, 'tcx>, ia: &ast::InlineAsm)
     };
 
     let dialect = match ia.dialect {
-        ast::AsmAtt   => llvm::AD_ATT,
-        ast::AsmIntel => llvm::AD_Intel
+        AsmDialect::Att   => llvm::AD_ATT,
+        AsmDialect::Intel => llvm::AD_Intel
     };
 
     let asm = CString::new(ia.asm.as_bytes()).unwrap();
@@ -147,4 +159,3 @@ pub fn trans_inline_asm<'blk, 'tcx>(bcx: Block<'blk, 'tcx>, ia: &ast::InlineAsm)
     return bcx;
 
 }
-

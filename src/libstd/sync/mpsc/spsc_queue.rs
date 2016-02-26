@@ -33,11 +33,6 @@
 //! concurrently between two threads. This data structure is safe to use and
 //! enforces the semantics that there is one pusher and one popper.
 
-#![unstable(feature = "std_misc")]
-
-use core::prelude::*;
-
-use alloc::boxed;
 use alloc::boxed::Box;
 use core::ptr;
 use core::cell::UnsafeCell;
@@ -80,7 +75,7 @@ unsafe impl<T: Send> Sync for Queue<T> { }
 
 impl<T> Node<T> {
     fn new() -> *mut Node<T> {
-        boxed::into_raw(box Node {
+        Box::into_raw(box Node {
             value: None,
             next: AtomicPtr::new(ptr::null_mut::<Node<T>>()),
         })
@@ -201,7 +196,7 @@ impl<T> Queue<T> {
                     let _: Box<Node<T>> = Box::from_raw(tail);
                 }
             }
-            return ret;
+            ret
         }
     }
 
@@ -212,14 +207,13 @@ impl<T> Queue<T> {
     /// The reference returned is invalid if it is not used before the consumer
     /// pops the value off the queue. If the producer then pushes another value
     /// onto the queue, it will overwrite the value pointed to by the reference.
-    pub fn peek<'a>(&'a self) -> Option<&'a mut T> {
+    pub fn peek(&self) -> Option<&mut T> {
         // This is essentially the same as above with all the popping bits
         // stripped out.
         unsafe {
             let tail = *self.tail.get();
             let next = (*tail).next.load(Ordering::Acquire);
-            if next.is_null() { return None }
-            return (*next).value.as_mut();
+            if next.is_null() { None } else { (*next).value.as_mut() }
         }
     }
 }

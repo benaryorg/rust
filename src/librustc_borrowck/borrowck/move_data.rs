@@ -20,15 +20,17 @@ use rustc::middle::dataflow::BitwiseOperator;
 use rustc::middle::dataflow::DataFlowOperator;
 use rustc::middle::dataflow::KillFrom;
 use rustc::middle::expr_use_visitor as euv;
+use rustc::middle::expr_use_visitor::MutateMode;
 use rustc::middle::ty;
 use rustc::util::nodemap::{FnvHashMap, NodeSet};
-use rustc::util::ppaux::Repr;
+
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::usize;
 use syntax::ast;
 use syntax::ast_util;
 use syntax::codemap::Span;
+use rustc_front::hir;
 
 #[path="fragments.rs"]
 pub mod fragments;
@@ -159,6 +161,9 @@ pub struct Assignment {
 
     /// span of node where assignment occurs
     pub span: Span,
+
+    /// id for l-value expression on lhs of assignment
+    pub assignee_id: ast::NodeId,
 }
 
 #[derive(Copy, Clone)]
@@ -191,7 +196,7 @@ fn loan_path_is_precise(loan_path: &LoanPath) -> bool {
         LpVar(_) | LpUpvar(_) => {
             true
         }
-        LpExtend(_, _, LpInterior(InteriorKind::InteriorElement(..))) => {
+        LpExtend(_, _, LpInterior(_, InteriorKind::InteriorElement(..))) => {
             // Paths involving element accesses a[i] do not refer to a unique
             // location, as there is no accurate tracking of the indices.
             //
@@ -202,7 +207,7 @@ fn loan_path_is_precise(loan_path: &LoanPath) -> bool {
         }
         LpDowncast(ref lp_base, _) |
         LpExtend(ref lp_base, _, _) => {
-            loan_path_is_precise(&**lp_base)
+            loan_path_is_precise(&lp_base)
         }
     }
 }
@@ -313,8 +318,8 @@ impl<'tcx> MoveData<'tcx> {
             }
         };
 
-        debug!("move_path(lp={}, index={:?})",
-               lp.repr(tcx),
+        debug!("move_path(lp={:?}, index={:?})",
+               lp,
                index);
 
         assert_eq!(index.get(), self.paths.borrow().len() - 1);
@@ -364,8 +369,8 @@ impl<'tcx> MoveData<'tcx> {
                     lp: Rc<LoanPath<'tcx>>,
                     id: ast::NodeId,
                     kind: MoveKind) {
-        debug!("add_move(lp={}, id={}, kind={:?})",
-               lp.repr(tcx),
+        debug!("add_move(lp={:?}, id={}, kind={:?})",
+               lp,
                id,
                kind);
 
@@ -394,34 +399,35 @@ impl<'tcx> MoveData<'tcx> {
                           span: Span,
                           assignee_id: ast::NodeId,
                           mode: euv::MutateMode) {
-        debug!("add_assignment(lp={}, assign_id={}, assignee_id={}",
-               lp.repr(tcx), assign_id, assignee_id);
+        debug!("add_assignment(lp={:?}, assign_id={}, assignee_id={}",
+               lp, assign_id, assignee_id);
 
         let path_index = self.move_path(tcx, lp.clone());
 
         self.fragments.borrow_mut().add_assignment(path_index);
 
         match mode {
-            euv::Init | euv::JustWrite => {
+            MutateMode::Init | MutateMode::JustWrite => {
                 self.assignee_ids.borrow_mut().insert(assignee_id);
             }
-            euv::WriteAndRead => { }
+            MutateMode::WriteAndRead => { }
         }
 
         let assignment = Assignment {
             path: path_index,
             id: assign_id,
             span: span,
+            assignee_id: assignee_id,
         };
 
         if self.is_var_path(path_index) {
-            debug!("add_assignment[var](lp={}, assignment={}, path_index={:?})",
-                   lp.repr(tcx), self.var_assignments.borrow().len(), path_index);
+            debug!("add_assignment[var](lp={:?}, assignment={}, path_index={:?})",
+                   lp, self.var_assignments.borrow().len(), path_index);
 
             self.var_assignments.borrow_mut().push(assignment);
         } else {
-            debug!("add_assignment[path](lp={}, path_index={:?})",
-                   lp.repr(tcx), path_index);
+            debug!("add_assignment[path](lp={:?}, path_index={:?})",
+                   lp, path_index);
 
             self.path_assignments.borrow_mut().push(assignment);
         }
@@ -437,8 +443,8 @@ impl<'tcx> MoveData<'tcx> {
                              pattern_id: ast::NodeId,
                              base_lp: Rc<LoanPath<'tcx>>,
                              mode: euv::MatchMode) {
-        debug!("add_variant_match(lp={}, pattern_id={})",
-               lp.repr(tcx), pattern_id);
+        debug!("add_variant_match(lp={:?}, pattern_id={})",
+               lp, pattern_id);
 
         let path_index = self.move_path(tcx, lp.clone());
         let base_path_index = self.move_path(tcx, base_lp.clone());
@@ -478,19 +484,19 @@ impl<'tcx> MoveData<'tcx> {
                             KillFrom::Execution, dfcx_moves);
         }
 
-        for assignment in &*self.path_assignments.borrow() {
+        for assignment in self.path_assignments.borrow().iter() {
             self.kill_moves(assignment.path, assignment.id,
                             KillFrom::Execution, dfcx_moves);
         }
 
         // Kill all moves related to a variable `x` when
         // it goes out of scope:
-        for path in &*self.paths.borrow() {
+        for path in self.paths.borrow().iter() {
             match path.loan_path.kind {
                 LpVar(..) | LpUpvar(..) | LpDowncast(..) => {
                     let kill_scope = path.loan_path.kill_scope(tcx);
                     let path = *self.path_map.borrow().get(&path.loan_path).unwrap();
-                    self.kill_moves(path, kill_scope.node_id(),
+                    self.kill_moves(path, kill_scope.node_id(&tcx.region_maps),
                                     KillFrom::ScopeEnd, dfcx_moves);
                 }
                 LpExtend(..) => {}
@@ -505,7 +511,7 @@ impl<'tcx> MoveData<'tcx> {
                 LpVar(..) | LpUpvar(..) | LpDowncast(..) => {
                     let kill_scope = lp.kill_scope(tcx);
                     dfcx_assign.add_kill(KillFrom::ScopeEnd,
-                                         kill_scope.node_id(),
+                                         kill_scope.node_id(&tcx.region_maps),
                                          assignment_index);
                 }
                 LpExtend(..) => {
@@ -581,7 +587,7 @@ impl<'tcx> MoveData<'tcx> {
         // assignment referring to another location.
 
         let loan_path = self.path_loan_path(path);
-        if loan_path_is_precise(&*loan_path) {
+        if loan_path_is_precise(&loan_path) {
             self.each_applicable_move(path, |move_index| {
                 debug!("kill_moves add_kill {:?} kill_id={} move_index={}",
                        kill_kind, kill_id, move_index.get());
@@ -597,8 +603,8 @@ impl<'a, 'tcx> FlowedMoveData<'a, 'tcx> {
                tcx: &'a ty::ctxt<'tcx>,
                cfg: &cfg::CFG,
                id_range: ast_util::IdRange,
-               decl: &ast::FnDecl,
-               body: &ast::Block)
+               decl: &hir::FnDecl,
+               body: &hir::Block)
                -> FlowedMoveData<'a, 'tcx> {
         let mut dfcx_moves =
             DataFlowContext::new(tcx,
@@ -694,7 +700,7 @@ impl<'a, 'tcx> FlowedMoveData<'a, 'tcx> {
             if base_indices.iter().any(|x| x == &moved_path) {
                 // Scenario 1 or 2: `loan_path` or some base path of
                 // `loan_path` was moved.
-                if !f(the_move, &*self.move_data.path_loan_path(moved_path)) {
+                if !f(the_move, &self.move_data.path_loan_path(moved_path)) {
                     ret = false;
                 }
             } else {
@@ -704,7 +710,7 @@ impl<'a, 'tcx> FlowedMoveData<'a, 'tcx> {
                             // Scenario 3: some extension of `loan_path`
                             // was moved
                             f(the_move,
-                              &*self.move_data.path_loan_path(moved_path))
+                              &self.move_data.path_loan_path(moved_path))
                         } else {
                             true
                         }

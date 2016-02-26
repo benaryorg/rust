@@ -8,9 +8,9 @@
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
 
-use middle::ty::{self, IntVarValue, Ty};
-use rustc_data_structures::unify::UnifyKey;
 use syntax::ast;
+use middle::ty::{self, IntVarValue, Ty};
+use rustc_data_structures::unify::{Combine, UnifyKey};
 
 pub trait ToType<'tcx> {
     fn to_type(&self, tcx: &ty::ctxt<'tcx>) -> Ty<'tcx>;
@@ -23,11 +23,38 @@ impl UnifyKey for ty::IntVid {
     fn tag(_: Option<ty::IntVid>) -> &'static str { "IntVid" }
 }
 
+#[derive(PartialEq, Copy, Clone, Debug)]
+pub struct RegionVidKey {
+    /// The minimum region vid in the unification set. This is needed
+    /// to have a canonical name for a type to prevent infinite
+    /// recursion.
+    pub min_vid: ty::RegionVid
+}
+
+impl Combine for RegionVidKey {
+    fn combine(&self, other: &RegionVidKey) -> RegionVidKey {
+        let min_vid = if self.min_vid.index < other.min_vid.index {
+            self.min_vid
+        } else {
+            other.min_vid
+        };
+
+        RegionVidKey { min_vid: min_vid }
+    }
+}
+
+impl UnifyKey for ty::RegionVid {
+    type Value = RegionVidKey;
+    fn index(&self) -> u32 { self.index }
+    fn from_index(i: u32) -> ty::RegionVid { ty::RegionVid { index: i } }
+    fn tag(_: Option<ty::RegionVid>) -> &'static str { "RegionVid" }
+}
+
 impl<'tcx> ToType<'tcx> for IntVarValue {
     fn to_type(&self, tcx: &ty::ctxt<'tcx>) -> Ty<'tcx> {
         match *self {
-            ty::IntType(i) => ty::mk_mach_int(tcx, i),
-            ty::UintType(i) => ty::mk_mach_uint(tcx, i),
+            ty::IntType(i) => tcx.mk_mach_int(i),
+            ty::UintType(i) => tcx.mk_mach_uint(i),
         }
     }
 }
@@ -43,6 +70,6 @@ impl UnifyKey for ty::FloatVid {
 
 impl<'tcx> ToType<'tcx> for ast::FloatTy {
     fn to_type(&self, tcx: &ty::ctxt<'tcx>) -> Ty<'tcx> {
-        ty::mk_mach_float(tcx, *self)
+        tcx.mk_mach_float(*self)
     }
 }

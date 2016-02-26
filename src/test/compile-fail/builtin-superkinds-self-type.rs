@@ -13,7 +13,7 @@
 
 use std::sync::mpsc::{channel, Sender};
 
-trait Foo : Sync+'static {
+trait Foo : Sized+Sync+'static {
     fn foo(self, mut chan: Sender<Self>) { }
 }
 
@@ -23,5 +23,5 @@ impl <T: Sync> Foo for T { }
 fn main() {
     let (tx, rx) = channel();
     1193182.foo(tx);
-    assert!(rx.recv() == 1193182);
+    assert_eq!(rx.recv(), 1193182);
 }

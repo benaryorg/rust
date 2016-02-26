@@ -12,18 +12,28 @@ use prelude::v1::*;
 
 use ffi::CStr;
 use io;
-use libc::{self, c_int, size_t};
+use libc::{self, c_int, size_t, sockaddr, socklen_t};
+use net::{SocketAddr, Shutdown};
 use str;
-use sys::c;
-use net::SocketAddr;
 use sys::fd::FileDesc;
-use sys_common::{AsInner, FromInner};
+use sys_common::{AsInner, FromInner, IntoInner};
 use sys_common::net::{getsockopt, setsockopt};
 use time::Duration;
 
 pub use sys::{cvt, cvt_r};
+pub extern crate libc as netc;
 
 pub type wrlen_t = size_t;
+
+// See below for the usage of SOCK_CLOEXEC, but this constant is only defined on
+// Linux currently (e.g. support doesn't exist on other platforms). In order to
+// get name resolution to work and things to compile we just define a dummy
+// SOCK_CLOEXEC here for other platforms. Note that the dummy constant isn't
+// actually ever used (the blocks below are wrapped in `if cfg!` as well.
+#[cfg(target_os = "linux")]
+use libc::SOCK_CLOEXEC;
+#[cfg(not(target_os = "linux"))]
+const SOCK_CLOEXEC: c_int = 0;
 
 pub struct Socket(FileDesc);
 
@@ -33,8 +43,8 @@ pub fn cvt_gai(err: c_int) -> io::Result<()> {
     if err == 0 { return Ok(()) }
 
     let detail = unsafe {
-        str::from_utf8(CStr::from_ptr(c::gai_strerror(err)).to_bytes()).unwrap()
-            .to_string()
+        str::from_utf8(CStr::from_ptr(libc::gai_strerror(err)).to_bytes()).unwrap()
+            .to_owned()
     };
     Err(io::Error::new(io::ErrorKind::Other,
                        &format!("failed to lookup address information: {}",
@@ -48,6 +58,19 @@ impl Socket {
             SocketAddr::V6(..) => libc::AF_INET6,
         };
         unsafe {
+            // On linux we first attempt to pass the SOCK_CLOEXEC flag to
+            // atomically create the socket and set it as CLOEXEC. Support for
+            // this option, however, was added in 2.6.27, and we still support
+            // 2.6.18 as a kernel, so if the returned error is EINVAL we
+            // fallthrough to the fallback.
+            if cfg!(target_os = "linux") {
+                match cvt(libc::socket(fam, ty | SOCK_CLOEXEC, 0)) {
+                    Ok(fd) => return Ok(Socket(FileDesc::new(fd))),
+                    Err(ref e) if e.raw_os_error() == Some(libc::EINVAL) => {}
+                    Err(e) => return Err(e),
+                }
+            }
+
             let fd = try!(cvt(libc::socket(fam, ty, 0)));
             let fd = FileDesc::new(fd);
             fd.set_cloexec();
@@ -55,8 +78,28 @@ impl Socket {
         }
     }
 
-    pub fn accept(&self, storage: *mut libc::sockaddr,
-                  len: *mut libc::socklen_t) -> io::Result<Socket> {
+    pub fn accept(&self, storage: *mut sockaddr, len: *mut socklen_t)
+                  -> io::Result<Socket> {
+        // Unfortunately the only known way right now to accept a socket and
+        // atomically set the CLOEXEC flag is to use the `accept4` syscall on
+        // Linux. This was added in 2.6.28, however, and because we support
+        // 2.6.18 we must detect this support dynamically.
+        if cfg!(target_os = "linux") {
+            weak! {
+                fn accept4(c_int, *mut sockaddr, *mut socklen_t, c_int) -> c_int
+            }
+            if let Some(accept) = accept4.get() {
+                let res = cvt_r(|| unsafe {
+                    accept(self.0.raw(), storage, len, SOCK_CLOEXEC)
+                });
+                match res {
+                    Ok(fd) => return Ok(Socket(FileDesc::new(fd))),
+                    Err(ref e) if e.raw_os_error() == Some(libc::ENOSYS) => {}
+                    Err(e) => return Err(e),
+                }
+            }
+        }
+
         let fd = try!(cvt_r(|| unsafe {
             libc::accept(self.0.raw(), storage, len)
         }));
@@ -66,10 +109,7 @@ impl Socket {
     }
 
     pub fn duplicate(&self) -> io::Result<Socket> {
-        let fd = try!(cvt(unsafe { libc::dup(self.0.raw()) }));
-        let fd = FileDesc::new(fd);
-        fd.set_cloexec();
-        Ok(Socket(fd))
+        self.0.duplicate().map(Socket)
     }
 
     pub fn read(&self, buf: &mut [u8]) -> io::Result<usize> {
@@ -79,19 +119,19 @@ impl Socket {
     pub fn set_timeout(&self, dur: Option<Duration>, kind: libc::c_int) -> io::Result<()> {
         let timeout = match dur {
             Some(dur) => {
-                if dur.secs() == 0 && dur.extra_nanos() == 0 {
+                if dur.as_secs() == 0 && dur.subsec_nanos() == 0 {
                     return Err(io::Error::new(io::ErrorKind::InvalidInput,
                                               "cannot set a 0 duration timeout"));
                 }
 
-                let secs = if dur.secs() > libc::time_t::max_value() as u64 {
+                let secs = if dur.as_secs() > libc::time_t::max_value() as u64 {
                     libc::time_t::max_value()
                 } else {
-                    dur.secs() as libc::time_t
+                    dur.as_secs() as libc::time_t
                 };
                 let mut timeout = libc::timeval {
                     tv_sec: secs,
-                    tv_usec: (dur.extra_nanos() / 1000) as libc::suseconds_t,
+                    tv_usec: (dur.subsec_nanos() / 1000) as libc::suseconds_t,
                 };
                 if timeout.tv_sec == 0 && timeout.tv_usec == 0 {
                     timeout.tv_usec = 1;
@@ -118,6 +158,16 @@ impl Socket {
             Ok(Some(Duration::new(sec, nsec)))
         }
     }
+
+    pub fn shutdown(&self, how: Shutdown) -> io::Result<()> {
+        let how = match how {
+            Shutdown::Write => libc::SHUT_WR,
+            Shutdown::Read => libc::SHUT_RD,
+            Shutdown::Both => libc::SHUT_RDWR,
+        };
+        try!(cvt(unsafe { libc::shutdown(self.0.raw(), how) }));
+        Ok(())
+    }
 }
 
 impl AsInner<c_int> for Socket {
@@ -126,4 +176,8 @@ impl AsInner<c_int> for Socket {
 
 impl FromInner<c_int> for Socket {
     fn from_inner(fd: c_int) -> Socket { Socket(FileDesc::new(fd)) }
+}
+
+impl IntoInner<c_int> for Socket {
+    fn into_inner(self) -> c_int { self.0.into_raw() }
 }

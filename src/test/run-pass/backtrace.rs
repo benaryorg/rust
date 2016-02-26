@@ -9,13 +9,12 @@
 // except according to those terms.
 
 // no-pretty-expanded FIXME #15189
-// ignore-windows FIXME #13259
 // ignore-android FIXME #17520
+// compile-flags:-g
 
 use std::env;
 use std::process::{Command, Stdio};
 use std::str;
-use std::ops::{Drop, FnMut, FnOnce};
 
 #[inline(never)]
 fn foo() {
@@ -52,7 +51,7 @@ fn runtest(me: &str) {
     let out = p.wait_with_output().unwrap();
     assert!(!out.status.success());
     let s = str::from_utf8(&out.stderr).unwrap();
-    assert!(s.contains("stack backtrace") && s.contains("foo::h"),
+    assert!(s.contains("stack backtrace") && s.contains(" - foo"),
             "bad output: {}", s);
 
     // Make sure the stack trace is *not* printed
@@ -62,7 +61,7 @@ fn runtest(me: &str) {
     let out = p.wait_with_output().unwrap();
     assert!(!out.status.success());
     let s = str::from_utf8(&out.stderr).unwrap();
-    assert!(!s.contains("stack backtrace") && !s.contains("foo::h"),
+    assert!(!s.contains("stack backtrace") && !s.contains(" - foo"),
             "bad output2: {}", s);
 
     // Make sure a stack trace is printed
@@ -72,7 +71,7 @@ fn runtest(me: &str) {
     let s = str::from_utf8(&out.stderr).unwrap();
     // loosened the following from double::h to double:: due to
     // spurious failures on mac, 32bit, optimized
-    assert!(s.contains("stack backtrace") && s.contains("double::"),
+    assert!(s.contains("stack backtrace") && s.contains(" - double"),
             "bad output3: {}", s);
 
     // Make sure a stack trace isn't printed too many times
@@ -90,6 +89,10 @@ fn runtest(me: &str) {
 }
 
 fn main() {
+    if cfg!(windows) && cfg!(target_arch = "x86") && cfg!(target_env = "gnu") {
+        return
+    }
+
     let args: Vec<String> = env::args().collect();
     if args.len() >= 2 && args[1] == "fail" {
         foo();

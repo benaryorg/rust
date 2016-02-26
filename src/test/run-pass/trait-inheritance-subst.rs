@@ -13,7 +13,7 @@ pub trait Add<RHS,Result> {
     fn add(&self, rhs: &RHS) -> Result;
 }
 
-trait MyNum : Add<Self,Self> { }
+trait MyNum : Sized + Add<Self,Self> { }
 
 struct MyInt { val: isize }
 
@@ -32,5 +32,5 @@ fn mi(v: isize) -> MyInt { MyInt { val: v } }
 pub fn main() {
     let (x, y) = (mi(3), mi(5));
     let z = f(x, y);
-    assert!(z.val == 8)
+    assert_eq!(z.val, 8)
 }

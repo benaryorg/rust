@@ -18,7 +18,9 @@ use io::lazy::Lazy;
 use io::{self, BufReader, LineWriter};
 use sync::{Arc, Mutex, MutexGuard};
 use sys::stdio;
+use sys_common::io::{read_to_end_uninitialized};
 use sys_common::remutex::{ReentrantMutex, ReentrantMutexGuard};
+use thread::LocalKeyState;
 
 /// Stdout used by print! and println! macros
 thread_local! {
@@ -52,27 +54,27 @@ struct StderrRaw(stdio::Stderr);
 /// handles is **not** available to raw handles returned from this function.
 ///
 /// The returned handle has no external synchronization or buffering.
-fn stdin_raw() -> StdinRaw { StdinRaw(stdio::Stdin::new()) }
+fn stdin_raw() -> io::Result<StdinRaw> { stdio::Stdin::new().map(StdinRaw) }
 
-/// Constructs a new raw handle to the standard input stream of this process.
+/// Constructs a new raw handle to the standard output stream of this process.
 ///
 /// The returned handle does not interact with any other handles created nor
 /// handles returned by `std::io::stdout`. Note that data is buffered by the
-/// `std::io::stdin` handles so writes which happen via this raw handle may
+/// `std::io::stdout` handles so writes which happen via this raw handle may
 /// appear before previous writes.
 ///
 /// The returned handle has no external synchronization or buffering layered on
 /// top.
-fn stdout_raw() -> StdoutRaw { StdoutRaw(stdio::Stdout::new()) }
+fn stdout_raw() -> io::Result<StdoutRaw> { stdio::Stdout::new().map(StdoutRaw) }
 
-/// Constructs a new raw handle to the standard input stream of this process.
+/// Constructs a new raw handle to the standard error stream of this process.
 ///
 /// The returned handle does not interact with any other handles created nor
-/// handles returned by `std::io::stdout`.
+/// handles returned by `std::io::stderr`.
 ///
 /// The returned handle has no external synchronization or buffering layered on
 /// top.
-fn stderr_raw() -> StderrRaw { StderrRaw(stdio::Stderr::new()) }
+fn stderr_raw() -> io::Result<StderrRaw> { stdio::Stderr::new().map(StderrRaw) }
 
 impl Read for StdinRaw {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> { self.0.read(buf) }
@@ -86,56 +88,137 @@ impl Write for StderrRaw {
     fn flush(&mut self) -> io::Result<()> { Ok(()) }
 }
 
+enum Maybe<T> {
+    Real(T),
+    Fake,
+}
+
+impl<W: io::Write> io::Write for Maybe<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        match *self {
+            Maybe::Real(ref mut w) => handle_ebadf(w.write(buf), buf.len()),
+            Maybe::Fake => Ok(buf.len())
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        match *self {
+            Maybe::Real(ref mut w) => handle_ebadf(w.flush(), ()),
+            Maybe::Fake => Ok(())
+        }
+    }
+}
+
+impl<R: io::Read> io::Read for Maybe<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        match *self {
+            Maybe::Real(ref mut r) => handle_ebadf(r.read(buf), 0),
+            Maybe::Fake => Ok(0)
+        }
+    }
+}
+
+fn handle_ebadf<T>(r: io::Result<T>, default: T) -> io::Result<T> {
+    #[cfg(windows)]
+    const ERR: i32 = ::sys::c::ERROR_INVALID_HANDLE as i32;
+    #[cfg(not(windows))]
+    const ERR: i32 = ::libc::EBADF as i32;
+
+    match r {
+        Err(ref e) if e.raw_os_error() == Some(ERR) => Ok(default),
+        r => r
+    }
+}
+
 /// A handle to the standard input stream of a process.
 ///
 /// Each handle is a shared reference to a global buffer of input data to this
-/// process. A handle can be `lock`'d to gain full access to `BufRead` methods
+/// process. A handle can be `lock`'d to gain full access to [`BufRead`] methods
 /// (e.g. `.lines()`). Writes to this handle are otherwise locked with respect
 /// to other writes.
 ///
 /// This handle implements the `Read` trait, but beware that concurrent reads
 /// of `Stdin` must be executed with care.
 ///
-/// Created by the function `io::stdin()`.
+/// Created by the [`io::stdin`] method.
+///
+/// [`io::stdin`]: fn.stdin.html
+/// [`BufRead`]: trait.BufRead.html
 #[stable(feature = "rust1", since = "1.0.0")]
 pub struct Stdin {
-    inner: Arc<Mutex<BufReader<StdinRaw>>>,
+    inner: Arc<Mutex<BufReader<Maybe<StdinRaw>>>>,
 }
 
-/// A locked reference to the a `Stdin` handle.
+/// A locked reference to the `Stdin` handle.
 ///
-/// This handle implements both the `Read` and `BufRead` traits and is
-/// constructed via the `lock` method on `Stdin`.
+/// This handle implements both the [`Read`] and [`BufRead`] traits, and
+/// is constructed via the [`Stdin::lock`] method.
+///
+/// [`Read`]: trait.Read.html
+/// [`BufRead`]: trait.BufRead.html
+/// [`Stdin::lock`]: struct.Stdin.html#method.lock
 #[stable(feature = "rust1", since = "1.0.0")]
 pub struct StdinLock<'a> {
-    inner: MutexGuard<'a, BufReader<StdinRaw>>,
+    inner: MutexGuard<'a, BufReader<Maybe<StdinRaw>>>,
 }
 
-/// Creates a new handle to the global standard input stream of this process.
+/// Constructs a new handle to the standard input of the current process.
 ///
-/// The handle returned refers to a globally shared buffer between all threads.
-/// Access is synchronized and can be explicitly controlled with the `lock()`
-/// method.
+/// Each handle returned is a reference to a shared global buffer whose access
+/// is synchronized via a mutex. If you need more explicit control over
+/// locking, see the [`lock() method`][lock].
 ///
-/// The `Read` trait is implemented for the returned value but the `BufRead`
-/// trait is not due to the global nature of the standard input stream. The
-/// locked version, `StdinLock`, implements both `Read` and `BufRead`, however.
+/// [lock]: struct.Stdin.html#method.lock
+///
+/// # Examples
+///
+/// Using implicit synchronization:
+///
+/// ```
+/// use std::io::{self, Read};
+///
+/// # fn foo() -> io::Result<String> {
+/// let mut buffer = String::new();
+/// try!(io::stdin().read_to_string(&mut buffer));
+/// # Ok(buffer)
+/// # }
+/// ```
+///
+/// Using explicit synchronization:
+///
+/// ```
+/// use std::io::{self, Read};
+///
+/// # fn foo() -> io::Result<String> {
+/// let mut buffer = String::new();
+/// let stdin = io::stdin();
+/// let mut handle = stdin.lock();
+///
+/// try!(handle.read_to_string(&mut buffer));
+/// # Ok(buffer)
+/// # }
+/// ```
 #[stable(feature = "rust1", since = "1.0.0")]
 pub fn stdin() -> Stdin {
-    static INSTANCE: Lazy<Mutex<BufReader<StdinRaw>>> = Lazy::new(stdin_init);
+    static INSTANCE: Lazy<Mutex<BufReader<Maybe<StdinRaw>>>> = Lazy::new(stdin_init);
     return Stdin {
         inner: INSTANCE.get().expect("cannot access stdin during shutdown"),
     };
 
-    fn stdin_init() -> Arc<Mutex<BufReader<StdinRaw>>> {
+    fn stdin_init() -> Arc<Mutex<BufReader<Maybe<StdinRaw>>>> {
+        let stdin = match stdin_raw() {
+            Ok(stdin) => Maybe::Real(stdin),
+            _ => Maybe::Fake
+        };
+
         // The default buffer capacity is 64k, but apparently windows
         // doesn't like 64k reads on stdin. See #13304 for details, but the
         // idea is that on windows we use a slightly smaller buffer that's
         // been seen to be acceptable.
         Arc::new(Mutex::new(if cfg!(windows) {
-            BufReader::with_capacity(8 * 1024, stdin_raw())
+            BufReader::with_capacity(8 * 1024, stdin)
         } else {
-            BufReader::new(stdin_raw())
+            BufReader::new(stdin)
         }))
     }
 }
@@ -145,8 +228,11 @@ impl Stdin {
     /// guard.
     ///
     /// The lock is released when the returned lock goes out of scope. The
-    /// returned guard also implements the `Read` and `BufRead` traits for
+    /// returned guard also implements the [`Read`] and [`BufRead`] traits for
     /// accessing the underlying data.
+    ///
+    /// [`Read`]: trait.Read.html
+    /// [`BufRead`]: trait.BufRead.html
     #[stable(feature = "rust1", since = "1.0.0")]
     pub fn lock(&self) -> StdinLock {
         StdinLock { inner: self.inner.lock().unwrap_or_else(|e| e.into_inner()) }
@@ -155,9 +241,33 @@ impl Stdin {
     /// Locks this handle and reads a line of input into the specified buffer.
     ///
     /// For detailed semantics of this method, see the documentation on
-    /// `BufRead::read_line`.
+    /// [`BufRead::read_line`].
+    ///
+    /// [`BufRead::read_line`]: trait.BufRead.html#method.read_line
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use std::io;
+    ///
+    /// let mut input = String::new();
+    /// match io::stdin().read_line(&mut input) {
+    ///     Ok(n) => {
+    ///         println!("{} bytes read", n);
+    ///         println!("{}", input);
+    ///     }
+    ///     Err(error) => println!("error: {}", error),
+    /// }
+    /// ```
+    ///
+    /// You can run the example one of two ways:
+    ///
+    /// - Pipe some text to it, e.g. `printf foo | path/to/executable`
+    /// - Give it text interactively by running the executable directly,
+    ///   in which case it will wait for the Enter key to be pressed before
+    ///   continuing
     #[stable(feature = "rust1", since = "1.0.0")]
-    pub fn read_line(&mut self, buf: &mut String) -> io::Result<usize> {
+    pub fn read_line(&self, buf: &mut String) -> io::Result<usize> {
         self.lock().read_line(buf)
     }
 }
@@ -173,6 +283,9 @@ impl Read for Stdin {
     fn read_to_string(&mut self, buf: &mut String) -> io::Result<usize> {
         self.lock().read_to_string(buf)
     }
+    fn read_exact(&mut self, buf: &mut [u8]) -> io::Result<()> {
+        self.lock().read_exact(buf)
+    }
 }
 
 #[stable(feature = "rust1", since = "1.0.0")]
@@ -180,7 +293,11 @@ impl<'a> Read for StdinLock<'a> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         self.inner.read(buf)
     }
+    fn read_to_end(&mut self, buf: &mut Vec<u8>) -> io::Result<usize> {
+        unsafe { read_to_end_uninitialized(self, buf) }
+    }
 }
+
 #[stable(feature = "rust1", since = "1.0.0")]
 impl<'a> BufRead for StdinLock<'a> {
     fn fill_buf(&mut self) -> io::Result<&[u8]> { self.inner.fill_buf() }
@@ -209,40 +326,79 @@ const OUT_MAX: usize = ::usize::MAX;
 /// output stream. Access is also synchronized via a lock and explicit control
 /// over locking is available via the `lock` method.
 ///
-/// Created by the function `io::stdout()`.
+/// Created by the [`io::stdout`] method.
+///
+/// [`io::stdout`]: fn.stdout.html
 #[stable(feature = "rust1", since = "1.0.0")]
 pub struct Stdout {
     // FIXME: this should be LineWriter or BufWriter depending on the state of
     //        stdout (tty or not). Note that if this is not line buffered it
     //        should also flush-on-panic or some form of flush-on-abort.
-    inner: Arc<ReentrantMutex<RefCell<LineWriter<StdoutRaw>>>>,
+    inner: Arc<ReentrantMutex<RefCell<LineWriter<Maybe<StdoutRaw>>>>>,
 }
 
-/// A locked reference to the a `Stdout` handle.
+/// A locked reference to the `Stdout` handle.
 ///
-/// This handle implements the `Write` trait and is constructed via the `lock`
-/// method on `Stdout`.
+/// This handle implements the [`Write`] trait, and is constructed via
+/// the [`Stdout::lock`] method.
+///
+/// [`Write`]: trait.Write.html
+/// [`Stdout::lock`]: struct.Stdout.html#method.lock
 #[stable(feature = "rust1", since = "1.0.0")]
 pub struct StdoutLock<'a> {
-    inner: ReentrantMutexGuard<'a, RefCell<LineWriter<StdoutRaw>>>,
+    inner: ReentrantMutexGuard<'a, RefCell<LineWriter<Maybe<StdoutRaw>>>>,
 }
 
-/// Constructs a new reference to the standard output of the current process.
+/// Constructs a new handle to the standard output of the current process.
 ///
 /// Each handle returned is a reference to a shared global buffer whose access
-/// is synchronized via a mutex. Explicit control over synchronization is
-/// provided via the `lock` method.
+/// is synchronized via a mutex. If you need more explicit control over
+/// locking, see the [Stdout::lock] method.
 ///
-/// The returned handle implements the `Write` trait.
+/// [Stdout::lock]: struct.Stdout.html#method.lock
+///
+/// # Examples
+///
+/// Using implicit synchronization:
+///
+/// ```
+/// use std::io::{self, Write};
+///
+/// # fn foo() -> io::Result<()> {
+/// try!(io::stdout().write(b"hello world"));
+///
+/// # Ok(())
+/// # }
+/// ```
+///
+/// Using explicit synchronization:
+///
+/// ```
+/// use std::io::{self, Write};
+///
+/// # fn foo() -> io::Result<()> {
+/// let stdout = io::stdout();
+/// let mut handle = stdout.lock();
+///
+/// try!(handle.write(b"hello world"));
+///
+/// # Ok(())
+/// # }
+/// ```
 #[stable(feature = "rust1", since = "1.0.0")]
 pub fn stdout() -> Stdout {
-    static INSTANCE: Lazy<ReentrantMutex<RefCell<LineWriter<StdoutRaw>>>> = Lazy::new(stdout_init);
+    static INSTANCE: Lazy<ReentrantMutex<RefCell<LineWriter<Maybe<StdoutRaw>>>>>
+        = Lazy::new(stdout_init);
     return Stdout {
         inner: INSTANCE.get().expect("cannot access stdout during shutdown"),
     };
 
-    fn stdout_init() -> Arc<ReentrantMutex<RefCell<LineWriter<StdoutRaw>>>> {
-        Arc::new(ReentrantMutex::new(RefCell::new(LineWriter::new(stdout_raw()))))
+    fn stdout_init() -> Arc<ReentrantMutex<RefCell<LineWriter<Maybe<StdoutRaw>>>>> {
+        let stdout = match stdout_raw() {
+            Ok(stdout) => Maybe::Real(stdout),
+            _ => Maybe::Fake,
+        };
+        Arc::new(ReentrantMutex::new(RefCell::new(LineWriter::new(stdout))))
     }
 }
 
@@ -285,36 +441,70 @@ impl<'a> Write for StdoutLock<'a> {
 
 /// A handle to the standard error stream of a process.
 ///
-/// For more information, see `stderr`
+/// For more information, see the [`io::stderr`] method.
+///
+/// [`io::stderr`]: fn.stderr.html
 #[stable(feature = "rust1", since = "1.0.0")]
 pub struct Stderr {
-    inner: Arc<ReentrantMutex<RefCell<StderrRaw>>>,
+    inner: Arc<ReentrantMutex<RefCell<Maybe<StderrRaw>>>>,
 }
 
-/// A locked reference to the a `Stderr` handle.
+/// A locked reference to the `Stderr` handle.
 ///
-/// This handle implements the `Write` trait and is constructed via the `lock`
-/// method on `Stderr`.
+/// This handle implements the `Write` trait and is constructed via
+/// the [`Stderr::lock`] method.
+///
+/// [`Stderr::lock`]: struct.Stderr.html#method.lock
 #[stable(feature = "rust1", since = "1.0.0")]
 pub struct StderrLock<'a> {
-    inner: ReentrantMutexGuard<'a, RefCell<StderrRaw>>,
+    inner: ReentrantMutexGuard<'a, RefCell<Maybe<StderrRaw>>>,
 }
 
-/// Constructs a new reference to the standard error stream of a process.
+/// Constructs a new handle to the standard error of the current process.
 ///
-/// Each returned handle is synchronized amongst all other handles created from
-/// this function. No handles are buffered, however.
+/// This handle is not buffered.
 ///
-/// The returned handle implements the `Write` trait.
+/// # Examples
+///
+/// Using implicit synchronization:
+///
+/// ```
+/// use std::io::{self, Write};
+///
+/// # fn foo() -> io::Result<()> {
+/// try!(io::stderr().write(b"hello world"));
+///
+/// # Ok(())
+/// # }
+/// ```
+///
+/// Using explicit synchronization:
+///
+/// ```
+/// use std::io::{self, Write};
+///
+/// # fn foo() -> io::Result<()> {
+/// let stderr = io::stderr();
+/// let mut handle = stderr.lock();
+///
+/// try!(handle.write(b"hello world"));
+///
+/// # Ok(())
+/// # }
+/// ```
 #[stable(feature = "rust1", since = "1.0.0")]
 pub fn stderr() -> Stderr {
-    static INSTANCE: Lazy<ReentrantMutex<RefCell<StderrRaw>>> = Lazy::new(stderr_init);
+    static INSTANCE: Lazy<ReentrantMutex<RefCell<Maybe<StderrRaw>>>> = Lazy::new(stderr_init);
     return Stderr {
         inner: INSTANCE.get().expect("cannot access stderr during shutdown"),
     };
 
-    fn stderr_init() -> Arc<ReentrantMutex<RefCell<StderrRaw>>> {
-        Arc::new(ReentrantMutex::new(RefCell::new(stderr_raw())))
+    fn stderr_init() -> Arc<ReentrantMutex<RefCell<Maybe<StderrRaw>>>> {
+        let stderr = match stderr_raw() {
+            Ok(stderr) => Maybe::Real(stderr),
+            _ => Maybe::Fake,
+        };
+        Arc::new(ReentrantMutex::new(RefCell::new(stderr)))
     }
 }
 
@@ -365,7 +555,8 @@ impl<'a> Write for StderrLock<'a> {
 /// output handle is to the process's stderr stream.
 #[unstable(feature = "set_stdio",
            reason = "this function may disappear completely or be replaced \
-                     with a more general mechanism")]
+                     with a more general mechanism",
+           issue = "0")]
 #[doc(hidden)]
 pub fn set_panic(sink: Box<Write + Send>) -> Option<Box<Write + Send>> {
     use panicking::LOCAL_STDERR;
@@ -388,7 +579,8 @@ pub fn set_panic(sink: Box<Write + Send>) -> Option<Box<Write + Send>> {
 /// output handle is to the process's stdout stream.
 #[unstable(feature = "set_stdio",
            reason = "this function may disappear completely or be replaced \
-                     with a more general mechanism")]
+                     with a more general mechanism",
+           issue = "0")]
 #[doc(hidden)]
 pub fn set_print(sink: Box<Write + Send>) -> Option<Box<Write + Send>> {
     use mem;
@@ -401,17 +593,35 @@ pub fn set_print(sink: Box<Write + Send>) -> Option<Box<Write + Send>> {
 }
 
 #[unstable(feature = "print",
-           reason = "implementation detail which may disappear or be replaced at any time")]
+           reason = "implementation detail which may disappear or be replaced at any time",
+           issue = "0")]
 #[doc(hidden)]
 pub fn _print(args: fmt::Arguments) {
-    let result = LOCAL_STDOUT.with(|s| {
-        if s.borrow_state() == BorrowState::Unused {
-            if let Some(w) = s.borrow_mut().as_mut() {
-                return w.write_fmt(args);
-            }
+    // As an implementation of the `println!` macro, we want to try our best to
+    // not panic wherever possible and get the output somewhere. There are
+    // currently two possible vectors for panics we take care of here:
+    //
+    // 1. If the TLS key for the local stdout has been destroyed, accessing it
+    //    would cause a panic. Note that we just lump in the uninitialized case
+    //    here for convenience, we're not trying to avoid a panic.
+    // 2. If the local stdout is currently in use (e.g. we're in the middle of
+    //    already printing) then accessing again would cause a panic.
+    //
+    // If, however, the actual I/O causes an error, we do indeed panic.
+    let result = match LOCAL_STDOUT.state() {
+        LocalKeyState::Uninitialized |
+        LocalKeyState::Destroyed => stdout().write_fmt(args),
+        LocalKeyState::Valid => {
+            LOCAL_STDOUT.with(|s| {
+                if s.borrow_state() == BorrowState::Unused {
+                    if let Some(w) = s.borrow_mut().as_mut() {
+                        return w.write_fmt(args);
+                    }
+                }
+                stdout().write_fmt(args)
+            })
         }
-        stdout().write_fmt(args)
-    });
+    };
     if let Err(e) = result {
         panic!("failed printing to stdout: {}", e);
     }

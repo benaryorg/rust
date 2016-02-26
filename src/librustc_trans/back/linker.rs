@@ -9,12 +9,20 @@
 // except according to those terms.
 
 use std::ffi::OsString;
+use std::fs::{self, File};
+use std::io::{self, BufWriter};
+use std::io::prelude::*;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use rustc_back::archive;
+use back::archive;
+use middle::cstore::CrateStore;
+use middle::dependency_format::Linkage;
 use session::Session;
+use session::config::CrateTypeDylib;
 use session::config;
+use syntax::ast;
+use trans::CrateTranslation;
 
 /// Linker abstraction used by back::link to build up the command to invoke a
 /// linker.
@@ -25,9 +33,11 @@ use session::config;
 /// MSVC linker (e.g. `link.exe`) is being used.
 pub trait Linker {
     fn link_dylib(&mut self, lib: &str);
+    fn link_rust_dylib(&mut self, lib: &str, path: &Path);
     fn link_framework(&mut self, framework: &str);
     fn link_staticlib(&mut self, lib: &str);
     fn link_rlib(&mut self, lib: &Path);
+    fn link_whole_rlib(&mut self, lib: &Path);
     fn link_whole_staticlib(&mut self, lib: &str, search_path: &[PathBuf]);
     fn include_path(&mut self, path: &Path);
     fn framework_path(&mut self, path: &Path);
@@ -36,6 +46,7 @@ pub trait Linker {
     fn gc_sections(&mut self, is_dylib: bool);
     fn position_independent_executable(&mut self);
     fn optimize(&mut self);
+    fn debuginfo(&mut self);
     fn no_default_libraries(&mut self);
     fn build_dylib(&mut self, out_filename: &Path);
     fn args(&mut self, args: &[String]);
@@ -43,6 +54,8 @@ pub trait Linker {
     fn hint_dynamic(&mut self);
     fn whole_archives(&mut self);
     fn no_whole_archives(&mut self);
+    fn export_symbols(&mut self, sess: &Session, trans: &CrateTranslation,
+                      tmpdir: &Path);
 }
 
 pub struct GnuLinker<'a> {
@@ -67,6 +80,10 @@ impl<'a> Linker for GnuLinker<'a> {
     fn position_independent_executable(&mut self) { self.cmd.arg("-pie"); }
     fn args(&mut self, args: &[String]) { self.cmd.args(args); }
 
+    fn link_rust_dylib(&mut self, lib: &str, _path: &Path) {
+        self.cmd.arg("-l").arg(lib);
+    }
+
     fn link_framework(&mut self, framework: &str) {
         self.cmd.arg("-framework").arg(framework);
     }
@@ -81,12 +98,19 @@ impl<'a> Linker for GnuLinker<'a> {
             // -force_load is the OSX equivalent of --whole-archive, but it
             // involves passing the full path to the library to link.
             let mut v = OsString::from("-Wl,-force_load,");
-            v.push(&archive::find_library(lib,
-                                          &target.options.staticlib_prefix,
-                                          &target.options.staticlib_suffix,
-                                          search_path,
-                                          &self.sess.diagnostic().handler));
+            v.push(&archive::find_library(lib, search_path, &self.sess));
             self.cmd.arg(&v);
+        }
+    }
+
+    fn link_whole_rlib(&mut self, lib: &Path) {
+        if self.sess.target.target.options.is_like_osx {
+            let mut v = OsString::from("-Wl,-force_load,");
+            v.push(lib);
+            self.cmd.arg(&v);
+        } else {
+            self.cmd.arg("-Wl,--whole-archive").arg(lib)
+                    .arg("-Wl,--no-whole-archive");
         }
     }
 
@@ -107,6 +131,9 @@ impl<'a> Linker for GnuLinker<'a> {
         // insert it here.
         if self.sess.target.target.options.is_like_osx {
             self.cmd.arg("-Wl,-dead_strip");
+        } else if self.sess.target.target.options.is_like_solaris {
+            self.cmd.arg("-Wl,-z");
+            self.cmd.arg("-Wl,ignore");
 
         // If we're building a dylib, we don't use --gc-sections because LLVM
         // has already done the best it can do, and we also don't want to
@@ -123,19 +150,18 @@ impl<'a> Linker for GnuLinker<'a> {
 
         // GNU-style linkers support optimization with -O. GNU ld doesn't
         // need a numeric argument, but other linkers do.
-        if self.sess.opts.optimize == config::Default ||
-           self.sess.opts.optimize == config::Aggressive {
+        if self.sess.opts.optimize == config::OptLevel::Default ||
+           self.sess.opts.optimize == config::OptLevel::Aggressive {
             self.cmd.arg("-Wl,-O1");
         }
     }
 
+    fn debuginfo(&mut self) {
+        // Don't do anything special here for GNU-style linkers.
+    }
+
     fn no_default_libraries(&mut self) {
-        // Unfortunately right now passing -nodefaultlibs to gcc on windows
-        // doesn't work so hot (in terms of native dependencies). This if
-        // statement should hopefully be removed one day though!
-        if !self.sess.target.target.options.is_like_windows {
-            self.cmd.arg("-nodefaultlibs");
-        }
+        self.cmd.arg("-nodefaultlibs");
     }
 
     fn build_dylib(&mut self, out_filename: &Path) {
@@ -172,6 +198,10 @@ impl<'a> Linker for GnuLinker<'a> {
         if !self.takes_hints() { return }
         self.cmd.arg("-Wl,-Bdynamic");
     }
+
+    fn export_symbols(&mut self, _: &Session, _: &CrateTranslation, _: &Path) {
+        // noop, visibility in object files takes care of this
+    }
 }
 
 pub struct MsvcLinker<'a> {
@@ -183,12 +213,31 @@ impl<'a> Linker for MsvcLinker<'a> {
     fn link_rlib(&mut self, lib: &Path) { self.cmd.arg(lib); }
     fn add_object(&mut self, path: &Path) { self.cmd.arg(path); }
     fn args(&mut self, args: &[String]) { self.cmd.args(args); }
-    fn build_dylib(&mut self, _out_filename: &Path) { self.cmd.arg("/DLL"); }
+
+    fn build_dylib(&mut self, out_filename: &Path) {
+        self.cmd.arg("/DLL");
+        let mut arg: OsString = "/IMPLIB:".into();
+        arg.push(out_filename.with_extension("dll.lib"));
+        self.cmd.arg(arg);
+    }
+
     fn gc_sections(&mut self, _is_dylib: bool) { self.cmd.arg("/OPT:REF,ICF"); }
 
     fn link_dylib(&mut self, lib: &str) {
         self.cmd.arg(&format!("{}.lib", lib));
     }
+
+    fn link_rust_dylib(&mut self, lib: &str, path: &Path) {
+        // When producing a dll, the MSVC linker may not actually emit a
+        // `foo.lib` file if the dll doesn't actually export any symbols, so we
+        // check to see if the file is there and just omit linking to it if it's
+        // not present.
+        let name = format!("{}.dll.lib", lib);
+        if fs::metadata(&path.join(&name)).is_ok() {
+            self.cmd.arg(name);
+        }
+    }
+
     fn link_staticlib(&mut self, lib: &str) {
         self.cmd.arg(&format!("{}.lib", lib));
     }
@@ -232,9 +281,20 @@ impl<'a> Linker for MsvcLinker<'a> {
         // not supported?
         self.link_staticlib(lib);
     }
+    fn link_whole_rlib(&mut self, path: &Path) {
+        // not supported?
+        self.link_rlib(path);
+    }
     fn optimize(&mut self) {
         // Needs more investigation of `/OPT` arguments
     }
+
+    fn debuginfo(&mut self) {
+        // This will cause the Microsoft linker to generate a PDB file
+        // from the CodeView line tables in the object files.
+        self.cmd.arg("/DEBUG");
+    }
+
     fn whole_archives(&mut self) {
         // hints not supported?
     }
@@ -250,4 +310,62 @@ impl<'a> Linker for MsvcLinker<'a> {
     // we do on Unix platforms.
     fn hint_static(&mut self) {}
     fn hint_dynamic(&mut self) {}
+
+    // Currently the compiler doesn't use `dllexport` (an LLVM attribute) to
+    // export symbols from a dynamic library. When building a dynamic library,
+    // however, we're going to want some symbols exported, so this function
+    // generates a DEF file which lists all the symbols.
+    //
+    // The linker will read this `*.def` file and export all the symbols from
+    // the dynamic library. Note that this is not as simple as just exporting
+    // all the symbols in the current crate (as specified by `trans.reachable`)
+    // but rather we also need to possibly export the symbols of upstream
+    // crates. Upstream rlibs may be linked statically to this dynamic library,
+    // in which case they may continue to transitively be used and hence need
+    // their symbols exported.
+    fn export_symbols(&mut self, sess: &Session, trans: &CrateTranslation,
+                      tmpdir: &Path) {
+        let path = tmpdir.join("lib.def");
+        let res = (|| -> io::Result<()> {
+            let mut f = BufWriter::new(try!(File::create(&path)));
+
+            // Start off with the standard module name header and then go
+            // straight to exports.
+            try!(writeln!(f, "LIBRARY"));
+            try!(writeln!(f, "EXPORTS"));
+
+            // Write out all our local symbols
+            for sym in trans.reachable.iter() {
+                try!(writeln!(f, "  {}", sym));
+            }
+
+            // Take a look at how all upstream crates are linked into this
+            // dynamic library. For all statically linked libraries we take all
+            // their reachable symbols and emit them as well.
+            let cstore = &sess.cstore;
+            let formats = sess.dependency_formats.borrow();
+            let symbols = formats[&CrateTypeDylib].iter();
+            let symbols = symbols.enumerate().filter_map(|(i, f)| {
+                if *f == Linkage::Static {
+                    Some((i + 1) as ast::CrateNum)
+                } else {
+                    None
+                }
+            }).flat_map(|cnum| {
+                cstore.reachable_ids(cnum)
+            }).map(|did| {
+                cstore.item_symbol(did)
+            });
+            for symbol in symbols {
+                try!(writeln!(f, "  {}", symbol));
+            }
+            Ok(())
+        })();
+        if let Err(e) = res {
+            sess.fatal(&format!("failed to write lib.def file: {}", e));
+        }
+        let mut arg = OsString::from("/DEF:");
+        arg.push(path);
+        self.cmd.arg(&arg);
+    }
 }

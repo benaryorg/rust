@@ -18,9 +18,10 @@
 use std::fmt;
 use std::iter::repeat;
 
+use rustc::middle::cstore::LOCAL_CRATE;
+use rustc::middle::def_id::{CRATE_DEF_INDEX, DefId};
 use syntax::abi::Abi;
-use syntax::ast;
-use syntax::ast_util;
+use rustc_front::hir;
 
 use clean;
 use html::item_type::ItemType;
@@ -30,15 +31,15 @@ use html::render::{cache, CURRENT_LOCATION_KEY};
 /// Helper to render an optional visibility with a space after it (if the
 /// visibility is preset)
 #[derive(Copy, Clone)]
-pub struct VisSpace(pub Option<ast::Visibility>);
+pub struct VisSpace(pub Option<hir::Visibility>);
 /// Similarly to VisSpace, this structure is used to render a function style with a
 /// space after it.
 #[derive(Copy, Clone)]
-pub struct UnsafetySpace(pub ast::Unsafety);
+pub struct UnsafetySpace(pub hir::Unsafety);
 /// Similarly to VisSpace, this structure is used to render a function constness
 /// with a space after it.
 #[derive(Copy, Clone)]
-pub struct ConstnessSpace(pub ast::Constness);
+pub struct ConstnessSpace(pub hir::Constness);
 /// Wrapper struct for properly emitting a method declaration.
 pub struct Method<'a>(pub &'a clean::SelfTy, pub &'a clean::FnDecl);
 /// Similar to VisSpace, but used for mutability
@@ -56,19 +57,19 @@ pub struct CommaSep<'a, T: 'a>(pub &'a [T]);
 pub struct AbiSpace(pub Abi);
 
 impl VisSpace {
-    pub fn get(&self) -> Option<ast::Visibility> {
+    pub fn get(&self) -> Option<hir::Visibility> {
         let VisSpace(v) = *self; v
     }
 }
 
 impl UnsafetySpace {
-    pub fn get(&self) -> ast::Unsafety {
+    pub fn get(&self) -> hir::Unsafety {
         let UnsafetySpace(v) = *self; v
     }
 }
 
 impl ConstnessSpace {
-    pub fn get(&self) -> ast::Constness {
+    pub fn get(&self) -> hir::Constness {
         let ConstnessSpace(v) = *self; v
     }
 }
@@ -201,8 +202,8 @@ impl fmt::Display for clean::TyParamBound {
             }
             clean::TraitBound(ref ty, modifier) => {
                 let modifier_str = match modifier {
-                    ast::TraitBoundModifier::None => "",
-                    ast::TraitBoundModifier::Maybe => "?",
+                    hir::TraitBoundModifier::None => "",
+                    hir::TraitBoundModifier::Maybe => "?",
                 };
                 write!(f, "{}{}", modifier_str, *ty)
             }
@@ -287,14 +288,14 @@ impl fmt::Display for clean::Path {
     }
 }
 
-pub fn href(did: ast::DefId) -> Option<(String, ItemType, Vec<String>)> {
+pub fn href(did: DefId) -> Option<(String, ItemType, Vec<String>)> {
     let cache = cache();
     let loc = CURRENT_LOCATION_KEY.with(|l| l.borrow().clone());
     let &(ref fqp, shortty) = match cache.paths.get(&did) {
         Some(p) => p,
         None => return None,
     };
-    let mut url = if ast_util::is_local(did) || cache.inlined.contains(&did) {
+    let mut url = if did.is_local() || cache.inlined.contains(&did) {
         repeat("../").take(loc.len()).collect::<String>()
     } else {
         match cache.extern_locations[&did.krate] {
@@ -324,7 +325,7 @@ pub fn href(did: ast::DefId) -> Option<(String, ItemType, Vec<String>)> {
 
 /// Used when rendering a `ResolvedPath` structure. This invokes the `path`
 /// rendering function with the necessary arguments for linking to a local path.
-fn resolved_path(w: &mut fmt::Formatter, did: ast::DefId, path: &clean::Path,
+fn resolved_path(w: &mut fmt::Formatter, did: DefId, path: &clean::Path,
                  print_all: bool) -> fmt::Result {
     let last = path.segments.last().unwrap();
     let rel_root = match &*path.segments[0].name {
@@ -335,8 +336,7 @@ fn resolved_path(w: &mut fmt::Formatter, did: ast::DefId, path: &clean::Path,
     if print_all {
         let amt = path.segments.len() - 1;
         match rel_root {
-            Some(root) => {
-                let mut root = String::from_str(&root);
+            Some(mut root) => {
                 for seg in &path.segments[..amt] {
                     if "super" == seg.name || "self" == seg.name {
                         try!(write!(w, "{}::", seg.name));
@@ -361,7 +361,7 @@ fn resolved_path(w: &mut fmt::Formatter, did: ast::DefId, path: &clean::Path,
     match href(did) {
         Some((url, shortty, fqp)) => {
             try!(write!(w, "<a class='{}' href='{}' title='{}'>{}</a>",
-                          shortty, url, fqp.connect("::"), last.name));
+                          shortty, url, fqp.join("::"), last.name));
         }
         _ => try!(write!(w, "{}", last.name)),
     }
@@ -375,18 +375,18 @@ fn primitive_link(f: &mut fmt::Formatter,
     let m = cache();
     let mut needs_termination = false;
     match m.primitive_locations.get(&prim) {
-        Some(&ast::LOCAL_CRATE) => {
+        Some(&LOCAL_CRATE) => {
             let len = CURRENT_LOCATION_KEY.with(|s| s.borrow().len());
             let len = if len == 0 {0} else {len - 1};
-            try!(write!(f, "<a href='{}primitive.{}.html'>",
+            try!(write!(f, "<a class='primitive' href='{}primitive.{}.html'>",
                         repeat("../").take(len).collect::<String>(),
                         prim.to_url_str()));
             needs_termination = true;
         }
         Some(&cnum) => {
-            let path = &m.paths[&ast::DefId {
+            let path = &m.paths[&DefId {
                 krate: cnum,
-                node: ast::CRATE_NODE_ID,
+                index: CRATE_DEF_INDEX,
             }];
             let loc = match m.extern_locations[&cnum] {
                 (_, render::Remote(ref s)) => Some(s.to_string()),
@@ -398,7 +398,7 @@ fn primitive_link(f: &mut fmt::Formatter,
             };
             match loc {
                 Some(root) => {
-                    try!(write!(f, "<a href='{}{}/primitive.{}.html'>",
+                    try!(write!(f, "<a class='primitive' href='{}{}/primitive.{}.html'>",
                                 root,
                                 path.0.first().unwrap(),
                                 prim.to_url_str()));
@@ -456,23 +456,44 @@ impl fmt::Display for clean::Type {
                        decl.decl)
             }
             clean::Tuple(ref typs) => {
-                primitive_link(f, clean::PrimitiveTuple,
-                               &*match &**typs {
-                                    [ref one] => format!("({},)", one),
-                                    many => format!("({})", CommaSep(&many)),
-                               })
+                match &**typs {
+                    [] => primitive_link(f, clean::PrimitiveTuple, "()"),
+                    [ref one] => {
+                        try!(primitive_link(f, clean::PrimitiveTuple, "("));
+                        try!(write!(f, "{},", one));
+                        primitive_link(f, clean::PrimitiveTuple, ")")
+                    }
+                    many => {
+                        try!(primitive_link(f, clean::PrimitiveTuple, "("));
+                        try!(write!(f, "{}", CommaSep(&many)));
+                        primitive_link(f, clean::PrimitiveTuple, ")")
+                    }
+                }
             }
             clean::Vector(ref t) => {
-                primitive_link(f, clean::Slice, &format!("[{}]", **t))
+                try!(primitive_link(f, clean::Slice, &format!("[")));
+                try!(write!(f, "{}", t));
+                primitive_link(f, clean::Slice, &format!("]"))
             }
             clean::FixedVector(ref t, ref s) => {
+                try!(primitive_link(f, clean::PrimitiveType::Array, "["));
+                try!(write!(f, "{}", t));
                 primitive_link(f, clean::PrimitiveType::Array,
-                               &format!("[{}; {}]", **t, *s))
+                               &format!("; {}]", *s))
             }
             clean::Bottom => f.write_str("!"),
             clean::RawPointer(m, ref t) => {
-                primitive_link(f, clean::PrimitiveType::PrimitiveRawPointer,
-                               &format!("*{}{}", RawMutableSpace(m), **t))
+                match **t {
+                    clean::Generic(_) | clean::ResolvedPath {is_generic: true, ..} => {
+                        primitive_link(f, clean::PrimitiveType::PrimitiveRawPointer,
+                                       &format!("*{}{}", RawMutableSpace(m), t))
+                    }
+                    _ => {
+                        try!(primitive_link(f, clean::PrimitiveType::PrimitiveRawPointer,
+                                            &format!("*{}", RawMutableSpace(m))));
+                        write!(f, "{}", t)
+                    }
+                }
             }
             clean::BorrowedRef{ lifetime: ref l, mutability, type_: ref ty} => {
                 let lt = match *l {
@@ -541,6 +562,19 @@ impl fmt::Display for clean::Type {
     }
 }
 
+impl fmt::Display for clean::Impl {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        try!(write!(f, "impl{} ", self.generics));
+        if let Some(ref ty) = self.trait_ {
+            try!(write!(f, "{}{} for ",
+                        if self.polarity == Some(clean::ImplPolarity::Negative) { "!" } else { "" },
+                        *ty));
+        }
+        try!(write!(f, "{}{}", self.for_, WhereClause(&self.generics)));
+        Ok(())
+    }
+}
+
 impl fmt::Display for clean::Arguments {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         for (i, input) in self.values.iter().enumerate() {
@@ -567,7 +601,11 @@ impl fmt::Display for clean::FunctionRetTy {
 
 impl fmt::Display for clean::FnDecl {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "({args}){arrow}", args = self.inputs, arrow = self.output)
+        if self.variadic {
+            write!(f, "({args}, ...){arrow}", args = self.inputs, arrow = self.output)
+        } else {
+            write!(f, "({args}){arrow}", args = self.inputs, arrow = self.output)
+        }
     }
 }
 
@@ -602,8 +640,8 @@ impl<'a> fmt::Display for Method<'a> {
 impl fmt::Display for VisSpace {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self.get() {
-            Some(ast::Public) => write!(f, "pub "),
-            Some(ast::Inherited) | None => Ok(())
+            Some(hir::Public) => write!(f, "pub "),
+            Some(hir::Inherited) | None => Ok(())
         }
     }
 }
@@ -611,8 +649,8 @@ impl fmt::Display for VisSpace {
 impl fmt::Display for UnsafetySpace {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self.get() {
-            ast::Unsafety::Unsafe => write!(f, "unsafe "),
-            ast::Unsafety::Normal => Ok(())
+            hir::Unsafety::Unsafe => write!(f, "unsafe "),
+            hir::Unsafety::Normal => Ok(())
         }
     }
 }
@@ -620,8 +658,8 @@ impl fmt::Display for UnsafetySpace {
 impl fmt::Display for ConstnessSpace {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self.get() {
-            ast::Constness::Const => write!(f, "const "),
-            ast::Constness::NotConst => Ok(())
+            hir::Constness::Const => write!(f, "const "),
+            hir::Constness::NotConst => Ok(())
         }
     }
 }
@@ -675,10 +713,15 @@ impl fmt::Display for clean::ViewListIdent {
         match self.source {
             Some(did) => {
                 let path = clean::Path::singleton(self.name.clone());
-                resolved_path(f, did, &path, false)
+                try!(resolved_path(f, did, &path, false));
             }
-            _ => write!(f, "{}", self.name),
+            _ => try!(write!(f, "{}", self.name)),
         }
+
+        if let Some(ref name) = self.rename {
+            try!(write!(f, " as {}", name));
+        }
+        Ok(())
     }
 }
 

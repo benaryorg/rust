@@ -13,8 +13,6 @@
 //! This primitive is meant to be used to run one-time initialization. An
 //! example use case would be for initializing an FFI library.
 
-use prelude::v1::*;
-
 use isize;
 use sync::atomic::{AtomicIsize, Ordering};
 use sync::StaticMutex;
@@ -48,7 +46,7 @@ pub const ONCE_INIT: Once = Once::new();
 
 impl Once {
     /// Creates a new `Once` value.
-    #[unstable(feature = "std_misc")]
+    #[stable(feature = "once_new", since = "1.2.0")]
     pub const fn new() -> Once {
         Once {
             mutex: StaticMutex::new(),

@@ -8,6 +8,8 @@
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
 
+// ignore-emscripten no threads support
+
 #![feature(std_misc)]
 
 use std::thread;
@@ -20,10 +22,10 @@ fn start(tx: &Sender<Sender<String>>) {
     let mut a;
     let mut b;
     a = rx.recv().unwrap();
-    assert!(a == "A".to_string());
+    assert_eq!(a, "A".to_string());
     println!("{}", a);
     b = rx.recv().unwrap();
-    assert!(b == "B".to_string());
+    assert_eq!(b, "B".to_string());
     println!("{}", b);
 }
 

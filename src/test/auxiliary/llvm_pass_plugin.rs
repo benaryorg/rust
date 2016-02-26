@@ -14,8 +14,9 @@
 #![feature(rustc_private)]
 
 extern crate rustc;
+extern crate rustc_plugin;
 
-use rustc::plugin::Registry;
+use rustc_plugin::Registry;
 
 #[plugin_registrar]
 pub fn plugin_registrar(reg: &mut Registry) {
@@ -24,5 +25,5 @@ pub fn plugin_registrar(reg: &mut Registry) {
     // Normally, we would name a pass that was registered through
     // C++ static object constructors in the same .so file as the
     // plugin registrar.
-    reg.register_llvm_pass("inline");
+    reg.register_llvm_pass("gvn");
 }

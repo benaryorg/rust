@@ -20,16 +20,14 @@
 //! * Use define_* family of methods when you might be defining the ValueRef.
 //! * When in doubt, define.
 use llvm::{self, ValueRef};
-use middle::ty::{self, ClosureTyper};
-use syntax::abi;
+use middle::ty;
+use middle::infer;
+use syntax::abi::Abi;
 use trans::attributes;
 use trans::base;
-use trans::common;
 use trans::context::CrateContext;
-use trans::monomorphize;
 use trans::type_::Type;
 use trans::type_of;
-use util::ppaux::Repr;
 
 use std::ffi::CString;
 use libc::c_uint;
@@ -80,9 +78,6 @@ pub fn declare_fn(ccx: &CrateContext, name: &str, callconv: llvm::CallConv,
         llvm::SetFunctionAttribute(llfn, llvm::Attribute::NoRedZone)
     }
 
-    if ccx.is_split_stack_supported() && !ccx.sess().opts.cg.no_stack_check {
-        attributes::split_stack(llfn, true);
-    }
     llfn
 }
 
@@ -106,37 +101,35 @@ pub fn declare_cfn(ccx: &CrateContext, name: &str, fn_type: Type,
 /// update the declaration and return existing ValueRef instead.
 pub fn declare_rust_fn<'a, 'tcx>(ccx: &CrateContext<'a, 'tcx>, name: &str,
                                  fn_type: ty::Ty<'tcx>) -> ValueRef {
-    debug!("declare_rust_fn(name={:?}, fn_type={})", name,
-           fn_type.repr(ccx.tcx()));
-    let fn_type = monomorphize::normalize_associated_type(ccx.tcx(), &fn_type);
-    debug!("declare_rust_fn (after normalised associated types) fn_type={}",
-           fn_type.repr(ccx.tcx()));
+    debug!("declare_rust_fn(name={:?}, fn_type={:?})", name,
+           fn_type);
 
     let function_type; // placeholder so that the memory ownership works out ok
     let (sig, abi, env) = match fn_type.sty {
-        ty::ty_bare_fn(_, ref f) => {
+        ty::TyBareFn(_, ref f) => {
             (&f.sig, f.abi, None)
         }
-        ty::ty_closure(closure_did, substs) => {
-            let typer = common::NormalizingClosureTyper::new(ccx.tcx());
-            function_type = typer.closure_type(closure_did, substs);
+        ty::TyClosure(closure_did, ref substs) => {
+            let infcx = infer::normalizing_infer_ctxt(ccx.tcx(), &ccx.tcx().tables);
+            function_type = infcx.closure_type(closure_did, substs);
             let self_type = base::self_type_for_closure(ccx, closure_did, fn_type);
             let llenvironment_type = type_of::type_of_explicit_arg(ccx, self_type);
-            debug!("declare_rust_fn function_type={} self_type={}",
-                   function_type.repr(ccx.tcx()), self_type.repr(ccx.tcx()));
-            (&function_type.sig, abi::RustCall, Some(llenvironment_type))
+            debug!("declare_rust_fn function_type={:?} self_type={:?}",
+                   function_type, self_type);
+            (&function_type.sig, Abi::RustCall, Some(llenvironment_type))
         }
         _ => ccx.sess().bug("expected closure or fn")
     };
 
-    let sig = ty::Binder(ty::erase_late_bound_regions(ccx.tcx(), sig));
-    debug!("declare_rust_fn (after region erasure) sig={}", sig.repr(ccx.tcx()));
+    let sig = ccx.tcx().erase_late_bound_regions(sig);
+    let sig = infer::normalize_associated_type(ccx.tcx(), &sig);
+    debug!("declare_rust_fn (after region erasure) sig={:?}", sig);
     let llfty = type_of::type_of_rust_fn(ccx, env, &sig, abi);
     debug!("declare_rust_fn llfty={}", ccx.tn().type_to_string(llfty));
 
     // it is ok to directly access sig.0.output because we erased all
     // late-bound-regions above
-    let llfn = declare_fn(ccx, name, llvm::CCallConv, llfty, sig.0.output);
+    let llfn = declare_fn(ccx, name, llvm::CCallConv, llfty, sig.output);
     attributes::from_fn_type(ccx, fn_type).apply_llfn(llfn);
     llfn
 }
@@ -177,8 +170,8 @@ pub fn define_global(ccx: &CrateContext, name: &str, ty: Type) -> Option<ValueRe
 /// return None if the name already has a definition associated with it. In that
 /// case an error should be reported to the user, because it usually happens due
 /// to user’s fault (e.g. misuse of #[no_mangle] or #[export_name] attributes).
-pub fn define_fn(ccx: &CrateContext, name: &str, callconv: llvm::CallConv, fn_type: Type,
-                 output: ty::FnOutput) -> Option<ValueRef> {
+pub fn define_fn(ccx: &CrateContext, name: &str, callconv: llvm::CallConv,
+                 fn_type: Type, output: ty::FnOutput) -> Option<ValueRef> {
     if get_defined_value(ccx, name).is_some() {
         None
     } else {
@@ -225,20 +218,21 @@ pub fn define_rust_fn<'a, 'tcx>(ccx: &CrateContext<'a, 'tcx>, name: &str,
 /// Declare a Rust function with an intention to define it.
 ///
 /// Use this function when you intend to define a function. This function will
-/// return None if the name already has a definition associated with it. In that
-/// case an error should be reported to the user, because it usually happens due
-/// to user’s fault (e.g. misuse of #[no_mangle] or #[export_name] attributes).
-pub fn define_internal_rust_fn<'a, 'tcx>(ccx: &CrateContext<'a, 'tcx>, name: &str,
-                                         fn_type: ty::Ty<'tcx>) -> Option<ValueRef> {
+/// return panic if the name already has a definition associated with it. This
+/// can happen with #[no_mangle] or #[export_name], for example.
+pub fn define_internal_rust_fn<'a, 'tcx>(ccx: &CrateContext<'a, 'tcx>,
+                                         name: &str,
+                                         fn_type: ty::Ty<'tcx>) -> ValueRef {
     if get_defined_value(ccx, name).is_some() {
-        None
+        ccx.sess().fatal(&format!("symbol `{}` already defined", name))
     } else {
-        Some(declare_internal_rust_fn(ccx, name, fn_type))
+        declare_internal_rust_fn(ccx, name, fn_type)
     }
 }
 
 
-/// Get defined or externally defined (AvailableExternally linkage) value by name.
+/// Get defined or externally defined (AvailableExternally linkage) value by
+/// name.
 fn get_defined_value(ccx: &CrateContext, name: &str) -> Option<ValueRef> {
     debug!("get_defined_value(name={:?})", name);
     let namebuf = CString::new(name).unwrap_or_else(|_|{

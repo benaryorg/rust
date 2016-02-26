@@ -11,14 +11,13 @@
 /// This module provides linkage between rustc::middle::graph and
 /// libgraphviz traits.
 
-use std::borrow::IntoCow;
-
 // For clarity, rename the graphviz crate locally to dot.
 use graphviz as dot;
+use graphviz::IntoCow;
 
 use syntax::ast;
-use syntax::ast_map;
 
+use front::map as ast_map;
 use middle::cfg;
 
 pub type Node<'a> = (cfg::CFGIndex, &'a cfg::CFGNode);

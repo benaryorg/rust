@@ -14,19 +14,21 @@
 //! and thus uses bitvectors. Your job is simply to specify the so-called
 //! GEN and KILL bits for each expression.
 
-pub use self::EntryOrExit::*;
-
 use middle::cfg;
 use middle::cfg::CFGIndex;
 use middle::ty;
 use std::io;
+use std::mem;
 use std::usize;
-use std::iter::repeat;
 use syntax::ast;
 use syntax::ast_util::IdRange;
-use syntax::visit;
-use syntax::print::{pp, pprust};
+use syntax::print::pp;
+use syntax::print::pprust::PrintState;
 use util::nodemap::NodeMap;
+use rustc_front::hir;
+use rustc_front::intravisit;
+use rustc_front::print::pprust;
+
 
 #[derive(Copy, Clone, Debug)]
 pub enum EntryOrExit {
@@ -111,7 +113,7 @@ impl<'a, 'tcx, O:DataFlowOperator> pprust::PpAnn for DataFlowContext<'a, 'tcx, O
            ps: &mut pprust::State,
            node: pprust::AnnNode) -> io::Result<()> {
         let id = match node {
-            pprust::NodeIdent(_) | pprust::NodeName(_) => 0,
+            pprust::NodeName(_) => 0,
             pprust::NodeExpr(expr) => expr.id,
             pprust::NodeBlock(blk) => blk.id,
             pprust::NodeItem(_) | pprust::NodeSubItem(_) => 0,
@@ -159,7 +161,7 @@ impl<'a, 'tcx, O:DataFlowOperator> pprust::PpAnn for DataFlowContext<'a, 'tcx, O
     }
 }
 
-fn build_nodeid_to_index(decl: Option<&ast::FnDecl>,
+fn build_nodeid_to_index(decl: Option<&hir::FnDecl>,
                          cfg: &cfg::CFG) -> NodeMap<Vec<CFGIndex>> {
     let mut index = NodeMap();
 
@@ -182,7 +184,7 @@ fn build_nodeid_to_index(decl: Option<&ast::FnDecl>,
     return index;
 
     fn add_entries_from_fn_decl(index: &mut NodeMap<Vec<CFGIndex>>,
-                                decl: &ast::FnDecl,
+                                decl: &hir::FnDecl,
                                 entry: CFGIndex) {
         //! add mappings from the ast nodes for the formal bindings to
         //! the entry-node in the graph.
@@ -191,11 +193,11 @@ fn build_nodeid_to_index(decl: Option<&ast::FnDecl>,
             index: &'a mut NodeMap<Vec<CFGIndex>>,
         }
         let mut formals = Formals { entry: entry, index: index };
-        visit::walk_fn_decl(&mut formals, decl);
-        impl<'a, 'v> visit::Visitor<'v> for Formals<'a> {
-            fn visit_pat(&mut self, p: &ast::Pat) {
+        intravisit::walk_fn_decl(&mut formals, decl);
+        impl<'a, 'v> intravisit::Visitor<'v> for Formals<'a> {
+            fn visit_pat(&mut self, p: &hir::Pat) {
                 self.index.entry(p.id).or_insert(vec![]).push(self.entry);
-                visit::walk_pat(self, p)
+                intravisit::walk_pat(self, p)
             }
         }
     }
@@ -223,12 +225,13 @@ pub enum KillFrom {
 impl<'a, 'tcx, O:DataFlowOperator> DataFlowContext<'a, 'tcx, O> {
     pub fn new(tcx: &'a ty::ctxt<'tcx>,
                analysis_name: &'static str,
-               decl: Option<&ast::FnDecl>,
+               decl: Option<&hir::FnDecl>,
                cfg: &cfg::CFG,
                oper: O,
                id_range: IdRange,
                bits_per_id: usize) -> DataFlowContext<'a, 'tcx, O> {
-        let words_per_id = (bits_per_id + usize::BITS - 1) / usize::BITS;
+        let usize_bits = mem::size_of::<usize>() * 8;
+        let words_per_id = (bits_per_id + usize_bits - 1) / usize_bits;
         let num_nodes = cfg.graph.all_nodes().len();
 
         debug!("DataFlowContext::new(analysis_name: {}, id_range={:?}, \
@@ -239,11 +242,11 @@ impl<'a, 'tcx, O:DataFlowOperator> DataFlowContext<'a, 'tcx, O> {
 
         let entry = if oper.initial_value() { usize::MAX } else {0};
 
-        let zeroes: Vec<_> = repeat(0).take(num_nodes * words_per_id).collect();
-        let gens: Vec<_> = zeroes.clone();
-        let kills1: Vec<_> = zeroes.clone();
-        let kills2: Vec<_> = zeroes;
-        let on_entry: Vec<_> = repeat(entry).take(num_nodes * words_per_id).collect();
+        let zeroes = vec![0; num_nodes * words_per_id];
+        let gens = zeroes.clone();
+        let kills1 = zeroes.clone();
+        let kills2 = zeroes;
+        let on_entry = vec![entry; num_nodes * words_per_id];
 
         let nodeid_to_index = build_nodeid_to_index(decl, cfg);
 
@@ -337,7 +340,7 @@ impl<'a, 'tcx, O:DataFlowOperator> DataFlowContext<'a, 'tcx, O> {
         }
         let indices = get_cfg_indices(id, &self.nodeid_to_index);
         for &cfgidx in indices {
-            if !self.each_bit_for_node(Entry, cfgidx, |i| f(i)) {
+            if !self.each_bit_for_node(EntryOrExit::Entry, cfgidx, |i| f(i)) {
                 return false;
             }
         }
@@ -360,8 +363,8 @@ impl<'a, 'tcx, O:DataFlowOperator> DataFlowContext<'a, 'tcx, O> {
         let on_entry = &self.on_entry[start.. end];
         let temp_bits;
         let slice = match e {
-            Entry => on_entry,
-            Exit => {
+            EntryOrExit::Entry => on_entry,
+            EntryOrExit::Exit => {
                 let mut t = on_entry.to_vec();
                 self.apply_gen_kill(cfgidx, &mut t);
                 temp_bits = t;
@@ -407,10 +410,11 @@ impl<'a, 'tcx, O:DataFlowOperator> DataFlowContext<'a, 'tcx, O> {
         //! Returns false on the first call to `f` that returns false;
         //! if all calls to `f` return true, then returns true.
 
+        let usize_bits = mem::size_of::<usize>() * 8;
         for (word_index, &word) in words.iter().enumerate() {
             if word != 0 {
-                let base_index = word_index * usize::BITS;
-                for offset in 0..usize::BITS {
+                let base_index = word_index * usize_bits;
+                for offset in 0..usize_bits {
                     let bit = 1 << offset;
                     if (word & bit) != 0 {
                         // NB: we round up the total number of bits
@@ -496,7 +500,7 @@ impl<'a, 'tcx, O:DataFlowOperator> DataFlowContext<'a, 'tcx, O> {
 
 impl<'a, 'tcx, O:DataFlowOperator+Clone+'static> DataFlowContext<'a, 'tcx, O> {
 //                                ^^^^^^^^^^^^^ only needed for pretty printing
-    pub fn propagate(&mut self, cfg: &cfg::CFG, blk: &ast::Block) {
+    pub fn propagate(&mut self, cfg: &cfg::CFG, blk: &hir::Block) {
         //! Performs the data flow analysis.
 
         if self.bits_per_id == 0 {
@@ -511,7 +515,7 @@ impl<'a, 'tcx, O:DataFlowOperator+Clone+'static> DataFlowContext<'a, 'tcx, O> {
                 changed: true
             };
 
-            let mut temp: Vec<_> = repeat(0).take(words_per_id).collect();
+            let mut temp = vec![0; words_per_id];
             while propcx.changed {
                 propcx.changed = false;
                 propcx.reset(&mut temp);
@@ -523,14 +527,13 @@ impl<'a, 'tcx, O:DataFlowOperator+Clone+'static> DataFlowContext<'a, 'tcx, O> {
         debug!("{}", {
             let mut v = Vec::new();
             self.pretty_print_to(box &mut v, blk).unwrap();
-            println!("{}", String::from_utf8(v).unwrap());
-            ""
+            String::from_utf8(v).unwrap()
         });
     }
 
     fn pretty_print_to<'b>(&self, wr: Box<io::Write + 'b>,
-                           blk: &ast::Block) -> io::Result<()> {
-        let mut ps = pprust::rust_printer_annotated(wr, self);
+                           blk: &hir::Block) -> io::Result<()> {
+        let mut ps = pprust::rust_printer_annotated(wr, self, None);
         try!(ps.cbox(pprust::indent_unit));
         try!(ps.ibox(0));
         try!(ps.print_block(blk));
@@ -617,7 +620,7 @@ fn bits_to_string(words: &[usize]) -> String {
 
     for &word in words {
         let mut v = word;
-        for _ in 0..usize::BYTES {
+        for _ in 0..mem::size_of::<usize>() {
             result.push(sep);
             result.push_str(&format!("{:02x}", v & 0xFF));
             v >>= 8;
@@ -634,7 +637,7 @@ fn bitwise<Op:BitwiseOperator>(out_vec: &mut [usize],
                                op: &Op) -> bool {
     assert_eq!(out_vec.len(), in_vec.len());
     let mut changed = false;
-    for (out_elt, in_elt) in out_vec.iter_mut().zip(in_vec.iter()) {
+    for (out_elt, in_elt) in out_vec.iter_mut().zip(in_vec) {
         let old_val = *out_elt;
         let new_val = op.join(old_val, *in_elt);
         *out_elt = new_val;
@@ -646,8 +649,9 @@ fn bitwise<Op:BitwiseOperator>(out_vec: &mut [usize],
 fn set_bit(words: &mut [usize], bit: usize) -> bool {
     debug!("set_bit: words={} bit={}",
            mut_bits_to_string(words), bit_str(bit));
-    let word = bit / usize::BITS;
-    let bit_in_word = bit % usize::BITS;
+    let usize_bits = mem::size_of::<usize>() * 8;
+    let word = bit / usize_bits;
+    let bit_in_word = bit % usize_bits;
     let bit_mask = 1 << bit_in_word;
     debug!("word={} bit_in_word={} bit_mask={}", word, bit_in_word, word);
     let oldv = words[word];

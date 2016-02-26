@@ -9,18 +9,19 @@
 // except according to those terms.
 
 use llvm::{ContextRef, ModuleRef};
-use metadata::common::LinkMeta;
-use middle::dependency_format;
+use middle::cstore::LinkMeta;
 
 pub use self::base::trans_crate;
 pub use self::context::CrateContext;
 pub use self::common::gensym_name;
+pub use self::disr::Disr;
 
 #[macro_use]
 mod macros;
 
 mod adt;
 mod asm;
+mod assert_dep_graph;
 mod attributes;
 mod base;
 mod basic_block;
@@ -29,8 +30,10 @@ mod builder;
 mod cabi;
 mod cabi_aarch64;
 mod cabi_arm;
+mod cabi_asmjs;
 mod cabi_mips;
 mod cabi_powerpc;
+mod cabi_powerpc64;
 mod cabi_x86;
 mod cabi_x86_64;
 mod cabi_x86_win64;
@@ -44,6 +47,7 @@ mod controlflow;
 mod datum;
 mod debuginfo;
 mod declare;
+mod disr;
 mod expr;
 mod foreign;
 mod glue;
@@ -53,7 +57,9 @@ mod llrepr;
 mod machine;
 mod _match;
 mod meth;
+mod mir;
 mod monomorphize;
+mod collector;
 mod tvec;
 mod type_;
 mod type_of;
@@ -74,6 +80,5 @@ pub struct CrateTranslation {
     pub link: LinkMeta,
     pub metadata: Vec<u8>,
     pub reachable: Vec<String>,
-    pub crate_formats: dependency_format::Dependencies,
     pub no_builtins: bool,
 }

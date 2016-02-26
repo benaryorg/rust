@@ -10,6 +10,7 @@
 
 // compile-flags: -C no-prepopulate-passes
 
+#![crate_type = "lib"]
 #![feature(allocator)]
 
 pub struct S {
@@ -50,14 +51,16 @@ pub fn named_borrow<'r>(_: &'r i32) {
 pub fn unsafe_borrow(_: &UnsafeInner) {
 }
 
-// CHECK: @mutable_unsafe_borrow(%UnsafeInner* noalias dereferenceable(2))
+// CHECK: @mutable_unsafe_borrow(%UnsafeInner* dereferenceable(2))
 // ... unless this is a mutable borrow, those never alias
+// ... except that there's this LLVM bug that forces us to not use noalias, see #29485
 #[no_mangle]
 pub fn mutable_unsafe_borrow(_: &mut UnsafeInner) {
 }
 
-// CHECK: @mutable_borrow(i32* noalias dereferenceable(4))
+// CHECK: @mutable_borrow(i32* dereferenceable(4))
 // FIXME #25759 This should also have `nocapture`
+// ... there's this LLVM bug that forces us to not use noalias, see #29485
 #[no_mangle]
 pub fn mutable_borrow(_: &mut i32) {
 }
@@ -85,6 +88,54 @@ pub fn struct_return() -> S {
   S {
     _field: [0, 0, 0, 0]
   }
+}
+
+// Hack to get the correct size for the length part in slices
+// CHECK: @helper([[USIZE:i[0-9]+]])
+#[no_mangle]
+fn helper(_: usize) {
+}
+
+// CHECK: @slice(i8* noalias nonnull readonly, [[USIZE]])
+// FIXME #25759 This should also have `nocapture`
+#[no_mangle]
+fn slice(_: &[u8]) {
+}
+
+// CHECK: @mutable_slice(i8* nonnull, [[USIZE]])
+// FIXME #25759 This should also have `nocapture`
+// ... there's this LLVM bug that forces us to not use noalias, see #29485
+#[no_mangle]
+fn mutable_slice(_: &mut [u8]) {
+}
+
+// CHECK: @unsafe_slice(%UnsafeInner* nonnull, [[USIZE]])
+// unsafe interior means this isn't actually readonly and there may be aliases ...
+#[no_mangle]
+pub fn unsafe_slice(_: &[UnsafeInner]) {
+}
+
+// CHECK: @str(i8* noalias nonnull readonly, [[USIZE]])
+// FIXME #25759 This should also have `nocapture`
+#[no_mangle]
+fn str(_: &[u8]) {
+}
+
+// CHECK: @trait_borrow(i8* nonnull, void (i8*)** nonnull)
+// FIXME #25759 This should also have `nocapture`
+#[no_mangle]
+fn trait_borrow(_: &Drop) {
+}
+
+// CHECK: @trait_box(i8* noalias nonnull, void (i8*)** nonnull)
+#[no_mangle]
+fn trait_box(_: Box<Drop>) {
+}
+
+// CHECK: { i16*, [[USIZE]] } @return_slice(i16* noalias nonnull readonly, [[USIZE]])
+#[no_mangle]
+fn return_slice(x: &[u16]) -> &[u16] {
+  x
 }
 
 // CHECK: noalias i8* @allocator()

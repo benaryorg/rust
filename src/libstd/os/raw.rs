@@ -10,24 +10,40 @@
 
 //! Raw OS-specific types for the current platform/architecture
 
-#![unstable(feature = "raw_os", reason = "recently added API")]
+#![stable(feature = "raw_os", since = "1.1.0")]
 
-#[cfg(target_arch = "aarch64")]      pub type c_char = u8;
-#[cfg(not(target_arch = "aarch64"))] pub type c_char = i8;
-pub type c_schar = i8;
-pub type c_uchar = u8;
-pub type c_short = i16;
-pub type c_ushort = u16;
-pub type c_int = i32;
-pub type c_uint = u32;
-#[cfg(any(target_pointer_width = "32", windows))] pub type c_long = i32;
-#[cfg(any(target_pointer_width = "32", windows))] pub type c_ulong = u32;
-#[cfg(all(target_pointer_width = "64", not(windows)))] pub type c_long = i64;
-#[cfg(all(target_pointer_width = "64", not(windows)))] pub type c_ulong = u64;
-pub type c_longlong = i64;
-pub type c_ulonglong = u64;
-pub type c_float = f32;
-pub type c_double = f64;
+#[cfg(any(target_os = "android",
+          target_os = "emscripten",
+          all(target_os = "linux", any(target_arch = "aarch64",
+                                       target_arch = "arm",
+                                       target_arch = "powerpc",
+                                       target_arch = "powerpc64"))))]
+#[stable(feature = "raw_os", since = "1.1.0")] pub type c_char = u8;
+#[cfg(not(any(target_os = "android",
+              target_os = "emscripten",
+              all(target_os = "linux", any(target_arch = "aarch64",
+                                           target_arch = "arm",
+                                           target_arch = "powerpc",
+                                           target_arch = "powerpc64")))))]
+#[stable(feature = "raw_os", since = "1.1.0")] pub type c_char = i8;
+#[stable(feature = "raw_os", since = "1.1.0")] pub type c_schar = i8;
+#[stable(feature = "raw_os", since = "1.1.0")] pub type c_uchar = u8;
+#[stable(feature = "raw_os", since = "1.1.0")] pub type c_short = i16;
+#[stable(feature = "raw_os", since = "1.1.0")] pub type c_ushort = u16;
+#[stable(feature = "raw_os", since = "1.1.0")] pub type c_int = i32;
+#[stable(feature = "raw_os", since = "1.1.0")] pub type c_uint = u32;
+#[cfg(any(target_pointer_width = "32", windows))]
+#[stable(feature = "raw_os", since = "1.1.0")] pub type c_long = i32;
+#[cfg(any(target_pointer_width = "32", windows))]
+#[stable(feature = "raw_os", since = "1.1.0")] pub type c_ulong = u32;
+#[cfg(all(target_pointer_width = "64", not(windows)))]
+#[stable(feature = "raw_os", since = "1.1.0")] pub type c_long = i64;
+#[cfg(all(target_pointer_width = "64", not(windows)))]
+#[stable(feature = "raw_os", since = "1.1.0")] pub type c_ulong = u64;
+#[stable(feature = "raw_os", since = "1.1.0")] pub type c_longlong = i64;
+#[stable(feature = "raw_os", since = "1.1.0")] pub type c_ulonglong = u64;
+#[stable(feature = "raw_os", since = "1.1.0")] pub type c_float = f32;
+#[stable(feature = "raw_os", since = "1.1.0")] pub type c_double = f64;
 
 /// Type used to construct void pointers for use with C.
 ///
@@ -41,12 +57,18 @@ pub type c_double = f64;
 //     variants, because the compiler complains about the repr attribute
 //     otherwise.
 #[repr(u8)]
+#[stable(feature = "raw_os", since = "1.1.0")]
 pub enum c_void {
+    #[unstable(feature = "c_void_variant", reason = "should not have to exist",
+               issue = "0")]
     #[doc(hidden)] __variant1,
+    #[unstable(feature = "c_void_variant", reason = "should not have to exist",
+               issue = "0")]
     #[doc(hidden)] __variant2,
 }
 
 #[cfg(test)]
+#[allow(unused_imports)]
 mod tests {
     use any::TypeId;
     use libc;
@@ -59,34 +81,10 @@ mod tests {
         )*}
     }
 
-    macro_rules! ok_size {
-        ($($t:ident)*) => {$(
-            assert!(mem::size_of::<libc::$t>() == mem::size_of::<raw::$t>(),
-                    "{} is wrong", stringify!($t));
-        )*}
-    }
-
     #[test]
     fn same() {
         use os::raw;
         ok!(c_char c_schar c_uchar c_short c_ushort c_int c_uint c_long c_ulong
             c_longlong c_ulonglong c_float c_double);
-    }
-
-    #[cfg(unix)]
-    fn unix() {
-        {
-            use os::unix::raw;
-            ok!(uid_t gid_t dev_t ino_t mode_t nlink_t off_t blksize_t blkcnt_t);
-        }
-        {
-            use sys::platform::raw;
-            ok_size!(stat);
-        }
-    }
-
-    #[cfg(windows)]
-    fn windows() {
-        use os::windows::raw;
     }
 }

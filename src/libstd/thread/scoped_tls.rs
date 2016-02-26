@@ -24,7 +24,8 @@
 //! # Examples
 //!
 //! ```
-//! # #![feature(scoped_tls)]
+//! #![feature(scoped_tls)]
+//!
 //! scoped_thread_local!(static FOO: u32);
 //!
 //! // Initially each scoped slot is empty.
@@ -39,9 +40,10 @@
 //! });
 //! ```
 
-#![unstable(feature = "thread_local_internals")]
+#![unstable(feature = "thread_local_internals", issue = "0")]
 
-use prelude::v1::*;
+#[doc(hidden)]
+pub use self::imp::KeyInner as __KeyInner;
 
 /// Type representing a thread local storage key corresponding to a reference
 /// to the type parameter `T`.
@@ -52,47 +54,57 @@ use prelude::v1::*;
 /// their contents.
 #[unstable(feature = "scoped_tls",
            reason = "scoped TLS has yet to have wide enough use to fully consider \
-                     stabilizing its interface")]
-pub struct ScopedKey<T> { inner: imp::KeyInner<T> }
+                     stabilizing its interface",
+           issue = "27715")]
+pub struct ScopedKey<T:'static> { inner: fn() -> &'static imp::KeyInner<T> }
 
 /// Declare a new scoped thread local storage key.
 ///
 /// This macro declares a `static` item on which methods are used to get and
 /// set the value stored within.
 ///
-/// See [ScopedKey documentation](thread/struct.ScopedKey.html) for more information.
+/// See [ScopedKey documentation](thread/struct.ScopedKey.html) for more
+/// information.
+#[unstable(feature = "thread_local_internals",
+           reason = "should not be necessary",
+           issue = "0")]
 #[macro_export]
 #[allow_internal_unstable]
 macro_rules! scoped_thread_local {
     (static $name:ident: $t:ty) => (
-        #[cfg_attr(not(any(windows,
-                           target_os = "android",
-                           target_os = "ios",
-                           target_os = "openbsd",
-                           target_arch = "aarch64")),
-                   thread_local)]
-        static $name: ::std::thread::ScopedKey<$t> =
-            ::std::thread::ScopedKey::new();
+        static $name: $crate::thread::ScopedKey<$t> =
+            __scoped_thread_local_inner!($t);
     );
     (pub static $name:ident: $t:ty) => (
-        #[cfg_attr(not(any(windows,
-                           target_os = "android",
-                           target_os = "ios",
-                           target_os = "openbsd",
-                           target_arch = "aarch64")),
-                   thread_local)]
-        pub static $name: ::std::thread::ScopedKey<$t> =
-            ::std::thread::ScopedKey::new();
+        pub static $name: $crate::thread::ScopedKey<$t> =
+            __scoped_thread_local_inner!($t);
     );
+}
+
+#[doc(hidden)]
+#[unstable(feature = "thread_local_internals",
+           reason = "should not be necessary",
+           issue = "0")]
+#[macro_export]
+#[allow_internal_unstable]
+macro_rules! __scoped_thread_local_inner {
+    ($t:ty) => {{
+        #[cfg_attr(target_thread_local, thread_local)]
+        static _KEY: $crate::thread::__ScopedKeyInner<$t> =
+            $crate::thread::__ScopedKeyInner::new();
+        fn _getit() -> &'static $crate::thread::__ScopedKeyInner<$t> { &_KEY }
+        $crate::thread::ScopedKey::new(_getit)
+    }}
 }
 
 #[unstable(feature = "scoped_tls",
            reason = "scoped TLS has yet to have wide enough use to fully consider \
-                     stabilizing its interface")]
+                     stabilizing its interface",
+           issue = "27715")]
 impl<T> ScopedKey<T> {
     #[doc(hidden)]
-    pub const fn new() -> ScopedKey<T> {
-        ScopedKey { inner: imp::KeyInner::new() }
+    pub const fn new(inner: fn() -> &'static imp::KeyInner<T>) -> ScopedKey<T> {
+        ScopedKey { inner: inner }
     }
 
     /// Inserts a value into this scoped thread local storage slot for a
@@ -107,7 +119,8 @@ impl<T> ScopedKey<T> {
     /// # Examples
     ///
     /// ```
-    /// # #![feature(scoped_tls)]
+    /// #![feature(scoped_tls)]
+    ///
     /// scoped_thread_local!(static FOO: u32);
     ///
     /// FOO.set(&100, || {
@@ -137,13 +150,14 @@ impl<T> ScopedKey<T> {
             }
         }
 
+        let inner = (self.inner)();
         let prev = unsafe {
-            let prev = self.inner.get();
-            self.inner.set(t as *const T as *mut T);
+            let prev = inner.get();
+            inner.set(t as *const T as *mut T);
             prev
         };
 
-        let _reset = Reset { key: &self.inner, val: prev };
+        let _reset = Reset { key: inner, val: prev };
         cb()
     }
 
@@ -159,7 +173,8 @@ impl<T> ScopedKey<T> {
     /// # Examples
     ///
     /// ```no_run
-    /// # #![feature(scoped_tls)]
+    /// #![feature(scoped_tls)]
+    ///
     /// scoped_thread_local!(static FOO: u32);
     ///
     /// FOO.with(|slot| {
@@ -170,7 +185,7 @@ impl<T> ScopedKey<T> {
         F: FnOnce(&T) -> R
     {
         unsafe {
-            let ptr = self.inner.get();
+            let ptr = (self.inner)().get();
             assert!(!ptr.is_null(), "cannot access a scoped thread local \
                                      variable without calling `set` first");
             cb(&*ptr)
@@ -179,17 +194,15 @@ impl<T> ScopedKey<T> {
 
     /// Test whether this TLS key has been `set` for the current thread.
     pub fn is_set(&'static self) -> bool {
-        unsafe { !self.inner.get().is_null() }
+        unsafe { !(self.inner)().get().is_null() }
     }
 }
 
-#[cfg(not(any(windows,
-              target_os = "android",
-              target_os = "ios",
-              target_os = "openbsd",
-              target_arch = "aarch64")))]
+#[cfg(target_thread_local)]
+#[doc(hidden)]
 mod imp {
-    use std::cell::Cell;
+    use cell::Cell;
+    use ptr;
 
     pub struct KeyInner<T> { inner: Cell<*mut T> }
 
@@ -197,21 +210,16 @@ mod imp {
 
     impl<T> KeyInner<T> {
         pub const fn new() -> KeyInner<T> {
-            KeyInner { inner: Cell::new(0 as *mut _) }
+            KeyInner { inner: Cell::new(ptr::null_mut()) }
         }
         pub unsafe fn set(&self, ptr: *mut T) { self.inner.set(ptr); }
         pub unsafe fn get(&self) -> *mut T { self.inner.get() }
     }
 }
 
-#[cfg(any(windows,
-          target_os = "android",
-          target_os = "ios",
-          target_os = "openbsd",
-          target_arch = "aarch64"))]
+#[cfg(not(target_thread_local))]
+#[doc(hidden)]
 mod imp {
-    use prelude::v1::*;
-
     use cell::Cell;
     use marker;
     use sys_common::thread_local::StaticKey as OsStaticKey;
@@ -239,7 +247,6 @@ mod imp {
 #[cfg(test)]
 mod tests {
     use cell::Cell;
-    use prelude::v1::*;
 
     scoped_thread_local!(static FOO: u32);
 

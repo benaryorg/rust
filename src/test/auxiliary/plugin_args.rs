@@ -15,6 +15,7 @@
 
 extern crate syntax;
 extern crate rustc;
+extern crate rustc_plugin;
 
 use std::borrow::ToOwned;
 use syntax::ast;
@@ -24,7 +25,7 @@ use syntax::ext::base::{TTMacroExpander, ExtCtxt, MacResult, MacEager, NormalTT}
 use syntax::parse::token;
 use syntax::print::pprust;
 use syntax::ptr::P;
-use rustc::plugin::Registry;
+use rustc_plugin::Registry;
 
 struct Expander {
     args: Vec<P<ast::MetaItem>>,
@@ -36,7 +37,7 @@ impl TTMacroExpander for Expander {
                    sp: Span,
                    _: &[ast::TokenTree]) -> Box<MacResult+'cx> {
         let args = self.args.iter().map(|i| pprust::meta_item_to_string(&*i))
-            .collect::<Vec<_>>().connect(", ");
+            .collect::<Vec<_>>().join(", ");
         let interned = token::intern_and_get_ident(&args[..]);
         MacEager::expr(ecx.expr_str(sp, interned))
     }

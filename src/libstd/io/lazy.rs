@@ -10,10 +10,10 @@
 
 use prelude::v1::*;
 
-use boxed;
 use cell::Cell;
-use rt;
+use ptr;
 use sync::{StaticMutex, Arc};
+use sys_common;
 
 pub struct Lazy<T> {
     lock: StaticMutex,
@@ -27,7 +27,7 @@ impl<T: Send + Sync + 'static> Lazy<T> {
     pub const fn new(init: fn() -> Arc<T>) -> Lazy<T> {
         Lazy {
             lock: StaticMutex::new(),
-            ptr: Cell::new(0 as *mut _),
+            ptr: Cell::new(ptr::null_mut()),
             init: init
         }
     }
@@ -51,7 +51,7 @@ impl<T: Send + Sync + 'static> Lazy<T> {
         // `Arc` allocation in our own internal box (it will get deallocated by
         // the at exit handler). Otherwise we just return the freshly allocated
         // `Arc`.
-        let registered = rt::at_exit(move || {
+        let registered = sys_common::at_exit(move || {
             let g = self.lock.lock();
             let ptr = self.ptr.get();
             self.ptr.set(1 as *mut _);
@@ -60,8 +60,8 @@ impl<T: Send + Sync + 'static> Lazy<T> {
         });
         let ret = (self.init)();
         if registered.is_ok() {
-            self.ptr.set(boxed::into_raw(Box::new(ret.clone())));
+            self.ptr.set(Box::into_raw(Box::new(ret.clone())));
         }
-        return ret
+        ret
     }
 }

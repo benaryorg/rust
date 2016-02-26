@@ -26,7 +26,7 @@
 #
 #   * check - Run the complete test suite
 #
-#   * clean - Clean the build repertory. It is advised to run this
+#   * clean - Clean the build repository. It is advised to run this
 #             command if you want to build Rust again, after an update
 #             of the git repository.
 #
@@ -62,6 +62,7 @@
 #   * tidy-basic - show file / line stats
 #   * tidy-errors - show the highest rustc error code
 #   * tidy-features - show the status of language and lib features
+#   * rustc-stage$(stage) - Only build up to a specific stage
 #
 # Then mix in some of these environment variables to harness the
 # ultimate power of The Rust Build System.
@@ -90,7 +91,7 @@
 #
 # # Rust recipes for build system success
 #
-#     // Modifying libstd? Use this comment to run unit tests just on your change
+#     // Modifying libstd? Use this command to run unit tests just on your change
 #     make check-stage1-std NO_REBUILD=1 NO_BENCH=1
 #
 #     // Added a run-pass test? Use this to test running your test
@@ -219,17 +220,10 @@ endif
 # The test suite
 ifneq ($(strip $(findstring check,$(MAKECMDGOALS)) \
                $(findstring test,$(MAKECMDGOALS))  \
-               $(findstring perf,$(MAKECMDGOALS))  \
                $(findstring tidy,$(MAKECMDGOALS))),)
   CFG_INFO := $(info cfg: including test rules)
   include $(CFG_SRC_DIR)mk/tests.mk
   include $(CFG_SRC_DIR)mk/grammar.mk
-endif
-
-# Performance and benchmarking
-ifneq ($(findstring perf,$(MAKECMDGOALS)),)
-  CFG_INFO := $(info cfg: including perf rules)
-  include $(CFG_SRC_DIR)mk/perf.mk
 endif
 
 # Copy all the distributables to another directory for binary install

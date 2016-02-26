@@ -18,10 +18,9 @@ use cmp;
 use error;
 use fmt;
 use io::{self, DEFAULT_BUF_SIZE, Error, ErrorKind, SeekFrom};
-use ptr;
-use iter;
+use memchr;
 
-/// Wraps a `Read` and buffers input from it
+/// The `BufReader` struct adds buffering to any reader.
 ///
 /// It can be excessively inefficient to work directly with a `Read` instance.
 /// For example, every call to `read` on `TcpStream` results in a system call.
@@ -30,7 +29,7 @@ use iter;
 ///
 /// # Examples
 ///
-/// ```no_run
+/// ```
 /// use std::io::prelude::*;
 /// use std::io::BufReader;
 /// use std::fs::File;
@@ -48,46 +47,117 @@ use iter;
 #[stable(feature = "rust1", since = "1.0.0")]
 pub struct BufReader<R> {
     inner: R,
-    buf: Vec<u8>,
+    buf: Box<[u8]>,
     pos: usize,
     cap: usize,
 }
 
 impl<R: Read> BufReader<R> {
-    /// Creates a new `BufReader` with a default buffer capacity
+    /// Creates a new `BufReader` with a default buffer capacity.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::io::BufReader;
+    /// use std::fs::File;
+    ///
+    /// # fn foo() -> std::io::Result<()> {
+    /// let mut f = try!(File::open("log.txt"));
+    /// let mut reader = BufReader::new(f);
+    /// # Ok(())
+    /// # }
+    /// ```
     #[stable(feature = "rust1", since = "1.0.0")]
     pub fn new(inner: R) -> BufReader<R> {
         BufReader::with_capacity(DEFAULT_BUF_SIZE, inner)
     }
 
-    /// Creates a new `BufReader` with the specified buffer capacity
+    /// Creates a new `BufReader` with the specified buffer capacity.
+    ///
+    /// # Examples
+    ///
+    /// Creating a buffer with ten bytes of capacity:
+    ///
+    /// ```
+    /// use std::io::BufReader;
+    /// use std::fs::File;
+    ///
+    /// # fn foo() -> std::io::Result<()> {
+    /// let mut f = try!(File::open("log.txt"));
+    /// let mut reader = BufReader::with_capacity(10, f);
+    /// # Ok(())
+    /// # }
+    /// ```
     #[stable(feature = "rust1", since = "1.0.0")]
     pub fn with_capacity(cap: usize, inner: R) -> BufReader<R> {
-        let mut buf = Vec::with_capacity(cap);
-        buf.extend(iter::repeat(0).take(cap));
         BufReader {
             inner: inner,
-            buf: buf,
+            buf: vec![0; cap].into_boxed_slice(),
             pos: 0,
             cap: 0,
         }
     }
 
     /// Gets a reference to the underlying reader.
+    ///
+    /// It is inadvisable to directly read from the underlying reader.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::io::BufReader;
+    /// use std::fs::File;
+    ///
+    /// # fn foo() -> std::io::Result<()> {
+    /// let mut f1 = try!(File::open("log.txt"));
+    /// let mut reader = BufReader::new(f1);
+    ///
+    /// let f2 = reader.get_ref();
+    /// # Ok(())
+    /// # }
+    /// ```
     #[stable(feature = "rust1", since = "1.0.0")]
     pub fn get_ref(&self) -> &R { &self.inner }
 
     /// Gets a mutable reference to the underlying reader.
     ///
-    /// # Warning
-    ///
     /// It is inadvisable to directly read from the underlying reader.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::io::BufReader;
+    /// use std::fs::File;
+    ///
+    /// # fn foo() -> std::io::Result<()> {
+    /// let mut f1 = try!(File::open("log.txt"));
+    /// let mut reader = BufReader::new(f1);
+    ///
+    /// let f2 = reader.get_mut();
+    /// # Ok(())
+    /// # }
+    /// ```
     #[stable(feature = "rust1", since = "1.0.0")]
     pub fn get_mut(&mut self) -> &mut R { &mut self.inner }
 
     /// Unwraps this `BufReader`, returning the underlying reader.
     ///
     /// Note that any leftover data in the internal buffer is lost.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::io::BufReader;
+    /// use std::fs::File;
+    ///
+    /// # fn foo() -> std::io::Result<()> {
+    /// let mut f1 = try!(File::open("log.txt"));
+    /// let mut reader = BufReader::new(f1);
+    ///
+    /// let f2 = reader.into_inner();
+    /// # Ok(())
+    /// # }
+    /// ```
     #[stable(feature = "rust1", since = "1.0.0")]
     pub fn into_inner(self) -> R { self.inner }
 }
@@ -183,40 +253,122 @@ impl<R: Seek> Seek for BufReader<R> {
     }
 }
 
-/// Wraps a Writer and buffers output to it
+/// Wraps a writer and buffers its output.
 ///
-/// It can be excessively inefficient to work directly with a `Write`. For
-/// example, every call to `write` on `TcpStream` results in a system call. A
-/// `BufWriter` keeps an in memory buffer of data and writes it to the
-/// underlying `Write` in large, infrequent batches.
+/// It can be excessively inefficient to work directly with something that
+/// implements `Write`. For example, every call to `write` on `TcpStream`
+/// results in a system call. A `BufWriter` keeps an in-memory buffer of data
+/// and writes it to an underlying writer in large, infrequent batches.
 ///
 /// The buffer will be written out when the writer is dropped.
+///
+/// # Examples
+///
+/// Let's write the numbers one through ten to a `TcpStream`:
+///
+/// ```no_run
+/// use std::io::prelude::*;
+/// use std::net::TcpStream;
+///
+/// let mut stream = TcpStream::connect("127.0.0.1:34254").unwrap();
+///
+/// for i in 1..10 {
+///     stream.write(&[i]).unwrap();
+/// }
+/// ```
+///
+/// Because we're not buffering, we write each one in turn, incurring the
+/// overhead of a system call per byte written. We can fix this with a
+/// `BufWriter`:
+///
+/// ```no_run
+/// use std::io::prelude::*;
+/// use std::io::BufWriter;
+/// use std::net::TcpStream;
+///
+/// let mut stream = BufWriter::new(TcpStream::connect("127.0.0.1:34254").unwrap());
+///
+/// for i in 1..10 {
+///     stream.write(&[i]).unwrap();
+/// }
+/// ```
+///
+/// By wrapping the stream with a `BufWriter`, these ten writes are all grouped
+/// together by the buffer, and will all be written out in one system call when
+/// the `stream` is dropped.
 #[stable(feature = "rust1", since = "1.0.0")]
 pub struct BufWriter<W: Write> {
     inner: Option<W>,
     buf: Vec<u8>,
+    // #30888: If the inner writer panics in a call to write, we don't want to
+    // write the buffered data a second time in BufWriter's destructor. This
+    // flag tells the Drop impl if it should skip the flush.
+    panicked: bool,
 }
 
 /// An error returned by `into_inner` which combines an error that
 /// happened while writing out the buffer, and the buffered writer object
 /// which may be used to recover from the condition.
+///
+/// # Examples
+///
+/// ```no_run
+/// use std::io::BufWriter;
+/// use std::net::TcpStream;
+///
+/// let mut stream = BufWriter::new(TcpStream::connect("127.0.0.1:34254").unwrap());
+///
+/// // do stuff with the stream
+///
+/// // we want to get our `TcpStream` back, so let's try:
+///
+/// let stream = match stream.into_inner() {
+///     Ok(s) => s,
+///     Err(e) => {
+///         // Here, e is an IntoInnerError
+///         panic!("An error occurred");
+///     }
+/// };
+/// ```
 #[derive(Debug)]
 #[stable(feature = "rust1", since = "1.0.0")]
 pub struct IntoInnerError<W>(W, Error);
 
 impl<W: Write> BufWriter<W> {
-    /// Creates a new `BufWriter` with a default buffer capacity
+    /// Creates a new `BufWriter` with a default buffer capacity.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use std::io::BufWriter;
+    /// use std::net::TcpStream;
+    ///
+    /// let mut buffer = BufWriter::new(TcpStream::connect("127.0.0.1:34254").unwrap());
+    /// ```
     #[stable(feature = "rust1", since = "1.0.0")]
     pub fn new(inner: W) -> BufWriter<W> {
         BufWriter::with_capacity(DEFAULT_BUF_SIZE, inner)
     }
 
-    /// Creates a new `BufWriter` with the specified buffer capacity
+    /// Creates a new `BufWriter` with the specified buffer capacity.
+    ///
+    /// # Examples
+    ///
+    /// Creating a buffer with a buffer of a hundred bytes.
+    ///
+    /// ```no_run
+    /// use std::io::BufWriter;
+    /// use std::net::TcpStream;
+    ///
+    /// let stream = TcpStream::connect("127.0.0.1:34254").unwrap();
+    /// let mut buffer = BufWriter::with_capacity(100, stream);
+    /// ```
     #[stable(feature = "rust1", since = "1.0.0")]
     pub fn with_capacity(cap: usize, inner: W) -> BufWriter<W> {
         BufWriter {
             inner: Some(inner),
             buf: Vec::with_capacity(cap),
+            panicked: false,
         }
     }
 
@@ -225,7 +377,11 @@ impl<W: Write> BufWriter<W> {
         let len = self.buf.len();
         let mut ret = Ok(());
         while written < len {
-            match self.inner.as_mut().unwrap().write(&self.buf[written..]) {
+            self.panicked = true;
+            let r = self.inner.as_mut().unwrap().write(&self.buf[written..]);
+            self.panicked = false;
+
+            match r {
                 Ok(0) => {
                     ret = Err(Error::new(ErrorKind::WriteZero,
                                          "failed to write the buffered data"));
@@ -238,32 +394,60 @@ impl<W: Write> BufWriter<W> {
             }
         }
         if written > 0 {
-            // NB: would be better expressed as .remove(0..n) if it existed
-            unsafe {
-                ptr::copy(self.buf.as_ptr().offset(written as isize),
-                          self.buf.as_mut_ptr(),
-                          len - written);
-            }
+            self.buf.drain(..written);
         }
-        self.buf.truncate(len - written);
         ret
     }
 
     /// Gets a reference to the underlying writer.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use std::io::BufWriter;
+    /// use std::net::TcpStream;
+    ///
+    /// let mut buffer = BufWriter::new(TcpStream::connect("127.0.0.1:34254").unwrap());
+    ///
+    /// // we can use reference just like buffer
+    /// let reference = buffer.get_ref();
+    /// ```
     #[stable(feature = "rust1", since = "1.0.0")]
     pub fn get_ref(&self) -> &W { self.inner.as_ref().unwrap() }
 
-    /// Gets a mutable reference to the underlying write.
+    /// Gets a mutable reference to the underlying writer.
     ///
-    /// # Warning
+    /// It is inadvisable to directly write to the underlying writer.
     ///
-    /// It is inadvisable to directly read from the underlying writer.
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use std::io::BufWriter;
+    /// use std::net::TcpStream;
+    ///
+    /// let mut buffer = BufWriter::new(TcpStream::connect("127.0.0.1:34254").unwrap());
+    ///
+    /// // we can use reference just like buffer
+    /// let reference = buffer.get_mut();
+    /// ```
     #[stable(feature = "rust1", since = "1.0.0")]
     pub fn get_mut(&mut self) -> &mut W { self.inner.as_mut().unwrap() }
 
     /// Unwraps this `BufWriter`, returning the underlying writer.
     ///
     /// The buffer is written out before returning the writer.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use std::io::BufWriter;
+    /// use std::net::TcpStream;
+    ///
+    /// let mut buffer = BufWriter::new(TcpStream::connect("127.0.0.1:34254").unwrap());
+    ///
+    /// // unwrap the TcpStream and flush the buffer
+    /// let stream = buffer.into_inner().unwrap();
+    /// ```
     #[stable(feature = "rust1", since = "1.0.0")]
     pub fn into_inner(mut self) -> Result<W, IntoInnerError<BufWriter<W>>> {
         match self.flush_buf() {
@@ -280,7 +464,10 @@ impl<W: Write> Write for BufWriter<W> {
             try!(self.flush_buf());
         }
         if buf.len() >= self.buf.capacity() {
-            self.inner.as_mut().unwrap().write(buf)
+            self.panicked = true;
+            let r = self.inner.as_mut().unwrap().write(buf);
+            self.panicked = false;
+            r
         } else {
             let amt = cmp::min(buf.len(), self.buf.capacity());
             Write::write(&mut self.buf, &buf[..amt])
@@ -311,9 +498,10 @@ impl<W: Write + Seek> Seek for BufWriter<W> {
     }
 }
 
+#[stable(feature = "rust1", since = "1.0.0")]
 impl<W: Write> Drop for BufWriter<W> {
     fn drop(&mut self) {
-        if self.inner.is_some() {
+        if self.inner.is_some() && !self.panicked {
             // dtors should not panic, so we ignore a failed flush
             let _r = self.flush_buf();
         }
@@ -321,9 +509,34 @@ impl<W: Write> Drop for BufWriter<W> {
 }
 
 impl<W> IntoInnerError<W> {
-    /// Returns the error which caused the call to `into_inner` to fail.
+    /// Returns the error which caused the call to `into_inner()` to fail.
     ///
     /// This error was returned when attempting to write the internal buffer.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use std::io::BufWriter;
+    /// use std::net::TcpStream;
+    ///
+    /// let mut stream = BufWriter::new(TcpStream::connect("127.0.0.1:34254").unwrap());
+    ///
+    /// // do stuff with the stream
+    ///
+    /// // we want to get our `TcpStream` back, so let's try:
+    ///
+    /// let stream = match stream.into_inner() {
+    ///     Ok(s) => s,
+    ///     Err(e) => {
+    ///         // Here, e is an IntoInnerError, let's log the inner error.
+    ///         //
+    ///         // We'll just 'log' to stdout for this example.
+    ///         println!("{}", e.error());
+    ///
+    ///         panic!("An unexpected error occurred.");
+    ///     }
+    /// };
+    /// ```
     #[stable(feature = "rust1", since = "1.0.0")]
     pub fn error(&self) -> &Error { &self.1 }
 
@@ -331,6 +544,32 @@ impl<W> IntoInnerError<W> {
     ///
     /// The returned object can be used for error recovery, such as
     /// re-inspecting the buffer.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use std::io::BufWriter;
+    /// use std::net::TcpStream;
+    ///
+    /// let mut stream = BufWriter::new(TcpStream::connect("127.0.0.1:34254").unwrap());
+    ///
+    /// // do stuff with the stream
+    ///
+    /// // we want to get our `TcpStream` back, so let's try:
+    ///
+    /// let stream = match stream.into_inner() {
+    ///     Ok(s) => s,
+    ///     Err(e) => {
+    ///         // Here, e is an IntoInnerError, let's re-examine the buffer:
+    ///         let buffer = e.into_inner();
+    ///
+    ///         // do stuff to try to recover
+    ///
+    ///         // afterwards, let's just return the stream
+    ///         buffer.into_inner().unwrap()
+    ///     }
+    /// };
+    /// ```
     #[stable(feature = "rust1", since = "1.0.0")]
     pub fn into_inner(self) -> W { self.0 }
 }
@@ -354,17 +593,74 @@ impl<W> fmt::Display for IntoInnerError<W> {
     }
 }
 
-/// Wraps a Writer and buffers output to it, flushing whenever a newline
+/// Wraps a writer and buffers output to it, flushing whenever a newline
 /// (`0x0a`, `'\n'`) is detected.
 ///
-/// The buffer will be written out when the writer is dropped.
+/// The [`BufWriter`][bufwriter] struct wraps a writer and buffers its output.
+/// But it only does this batched write when it goes out of scope, or when the
+/// internal buffer is full. Sometimes, you'd prefer to write each line as it's
+/// completed, rather than the entire buffer at once. Enter `LineWriter`. It
+/// does exactly that.
+///
+/// [bufwriter]: struct.BufWriter.html
+///
+/// If there's still a partial line in the buffer when the `LineWriter` is
+/// dropped, it will flush those contents.
+///
+/// # Examples
+///
+/// We can use `LineWriter` to write one line at a time, significantly
+/// reducing the number of actual writes to the file.
+///
+/// ```
+/// use std::fs::File;
+/// use std::io::prelude::*;
+/// use std::io::LineWriter;
+///
+/// # fn foo() -> std::io::Result<()> {
+/// let road_not_taken = b"I shall be telling this with a sigh
+/// Somewhere ages and ages hence:
+/// Two roads diverged in a wood, and I -
+/// I took the one less traveled by,
+/// And that has made all the difference.";
+///
+/// let file = try!(File::create("poem.txt"));
+/// let mut file = LineWriter::new(file);
+///
+/// for &byte in road_not_taken.iter() {
+///    file.write(&[byte]).unwrap();
+/// }
+///
+/// // let's check we did the right thing.
+/// let mut file = try!(File::open("poem.txt"));
+/// let mut contents = String::new();
+///
+/// try!(file.read_to_string(&mut contents));
+///
+/// assert_eq!(contents.as_bytes(), &road_not_taken[..]);
+/// # Ok(())
+/// # }
+/// ```
 #[stable(feature = "rust1", since = "1.0.0")]
 pub struct LineWriter<W: Write> {
     inner: BufWriter<W>,
 }
 
 impl<W: Write> LineWriter<W> {
-    /// Creates a new `LineWriter`
+    /// Creates a new `LineWriter`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::fs::File;
+    /// use std::io::LineWriter;
+    ///
+    /// # fn foo() -> std::io::Result<()> {
+    /// let file = try!(File::create("poem.txt"));
+    /// let file = LineWriter::new(file);
+    /// # Ok(())
+    /// # }
+    /// ```
     #[stable(feature = "rust1", since = "1.0.0")]
     pub fn new(inner: W) -> LineWriter<W> {
         // Lines typically aren't that long, don't use a giant buffer
@@ -373,12 +669,40 @@ impl<W: Write> LineWriter<W> {
 
     /// Creates a new `LineWriter` with a specified capacity for the internal
     /// buffer.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::fs::File;
+    /// use std::io::LineWriter;
+    ///
+    /// # fn foo() -> std::io::Result<()> {
+    /// let file = try!(File::create("poem.txt"));
+    /// let file = LineWriter::with_capacity(100, file);
+    /// # Ok(())
+    /// # }
+    /// ```
     #[stable(feature = "rust1", since = "1.0.0")]
     pub fn with_capacity(cap: usize, inner: W) -> LineWriter<W> {
         LineWriter { inner: BufWriter::with_capacity(cap, inner) }
     }
 
     /// Gets a reference to the underlying writer.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::fs::File;
+    /// use std::io::LineWriter;
+    ///
+    /// # fn foo() -> std::io::Result<()> {
+    /// let file = try!(File::create("poem.txt"));
+    /// let file = LineWriter::new(file);
+    ///
+    /// let reference = file.get_ref();
+    /// # Ok(())
+    /// # }
+    /// ```
     #[stable(feature = "rust1", since = "1.0.0")]
     pub fn get_ref(&self) -> &W { self.inner.get_ref() }
 
@@ -386,12 +710,44 @@ impl<W: Write> LineWriter<W> {
     ///
     /// Caution must be taken when calling methods on the mutable reference
     /// returned as extra writes could corrupt the output stream.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::fs::File;
+    /// use std::io::LineWriter;
+    ///
+    /// # fn foo() -> std::io::Result<()> {
+    /// let file = try!(File::create("poem.txt"));
+    /// let mut file = LineWriter::new(file);
+    ///
+    /// // we can use reference just like file
+    /// let reference = file.get_mut();
+    /// # Ok(())
+    /// # }
+    /// ```
     #[stable(feature = "rust1", since = "1.0.0")]
     pub fn get_mut(&mut self) -> &mut W { self.inner.get_mut() }
 
     /// Unwraps this `LineWriter`, returning the underlying writer.
     ///
     /// The internal buffer is written out before returning the writer.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::fs::File;
+    /// use std::io::LineWriter;
+    ///
+    /// # fn foo() -> std::io::Result<()> {
+    /// let file = try!(File::create("poem.txt"));
+    ///
+    /// let writer: LineWriter<File> = LineWriter::new(file);
+    ///
+    /// let file: File = try!(writer.into_inner());
+    /// # Ok(())
+    /// # }
+    /// ```
     #[stable(feature = "rust1", since = "1.0.0")]
     pub fn into_inner(self) -> Result<W, IntoInnerError<LineWriter<W>>> {
         self.inner.into_inner().map_err(|IntoInnerError(buf, e)| {
@@ -403,7 +759,7 @@ impl<W: Write> LineWriter<W> {
 #[stable(feature = "rust1", since = "1.0.0")]
 impl<W: Write> Write for LineWriter<W> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        match buf.rposition_elem(&b'\n') {
+        match memchr::memrchr(b'\n', buf) {
             Some(i) => {
                 let n = try!(self.inner.write(&buf[..i + 1]));
                 if n != i + 1 { return Ok(n) }
@@ -428,137 +784,13 @@ impl<W: Write> fmt::Debug for LineWriter<W> where W: fmt::Debug {
     }
 }
 
-struct InternalBufWriter<W: Write>(BufWriter<W>);
-
-impl<W: Read + Write> InternalBufWriter<W> {
-    fn get_mut(&mut self) -> &mut BufWriter<W> {
-        let InternalBufWriter(ref mut w) = *self;
-        return w;
-    }
-}
-
-impl<W: Read + Write> Read for InternalBufWriter<W> {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        self.get_mut().inner.as_mut().unwrap().read(buf)
-    }
-}
-
-/// Wraps a Stream and buffers input and output to and from it.
-///
-/// It can be excessively inefficient to work directly with a `Read+Write`. For
-/// example, every call to `read` or `write` on `TcpStream` results in a system
-/// call. A `BufStream` keeps in memory buffers of data, making large,
-/// infrequent calls to `read` and `write` on the underlying `Read+Write`.
-///
-/// The output buffer will be written out when this stream is dropped.
-#[unstable(feature = "buf_stream",
-           reason = "unsure about semantics of buffering two directions, \
-                     leading to issues like #17136")]
-pub struct BufStream<S: Write> {
-    inner: BufReader<InternalBufWriter<S>>
-}
-
-#[unstable(feature = "buf_stream",
-           reason = "unsure about semantics of buffering two directions, \
-                     leading to issues like #17136")]
-impl<S: Read + Write> BufStream<S> {
-    /// Creates a new buffered stream with explicitly listed capacities for the
-    /// reader/writer buffer.
-    pub fn with_capacities(reader_cap: usize, writer_cap: usize, inner: S)
-                           -> BufStream<S> {
-        let writer = BufWriter::with_capacity(writer_cap, inner);
-        let internal_writer = InternalBufWriter(writer);
-        let reader = BufReader::with_capacity(reader_cap, internal_writer);
-        BufStream { inner: reader }
-    }
-
-    /// Creates a new buffered stream with the default reader/writer buffer
-    /// capacities.
-    pub fn new(inner: S) -> BufStream<S> {
-        BufStream::with_capacities(DEFAULT_BUF_SIZE, DEFAULT_BUF_SIZE, inner)
-    }
-
-    /// Gets a reference to the underlying stream.
-    pub fn get_ref(&self) -> &S {
-        let InternalBufWriter(ref w) = self.inner.inner;
-        w.get_ref()
-    }
-
-    /// Gets a mutable reference to the underlying stream.
-    ///
-    /// # Warning
-    ///
-    /// It is inadvisable to read directly from or write directly to the
-    /// underlying stream.
-    pub fn get_mut(&mut self) -> &mut S {
-        let InternalBufWriter(ref mut w) = self.inner.inner;
-        w.get_mut()
-    }
-
-    /// Unwraps this `BufStream`, returning the underlying stream.
-    ///
-    /// The internal write buffer is written out before returning the stream.
-    /// Any leftover data in the read buffer is lost.
-    pub fn into_inner(self) -> Result<S, IntoInnerError<BufStream<S>>> {
-        let BufReader { inner: InternalBufWriter(w), buf, pos, cap } = self.inner;
-        w.into_inner().map_err(|IntoInnerError(w, e)| {
-            IntoInnerError(BufStream {
-                inner: BufReader { inner: InternalBufWriter(w), buf: buf, pos: pos, cap: cap },
-            }, e)
-        })
-    }
-}
-
-#[unstable(feature = "buf_stream",
-           reason = "unsure about semantics of buffering two directions, \
-                     leading to issues like #17136")]
-impl<S: Read + Write> BufRead for BufStream<S> {
-    fn fill_buf(&mut self) -> io::Result<&[u8]> { self.inner.fill_buf() }
-    fn consume(&mut self, amt: usize) { self.inner.consume(amt) }
-}
-
-#[unstable(feature = "buf_stream",
-           reason = "unsure about semantics of buffering two directions, \
-                     leading to issues like #17136")]
-impl<S: Read + Write> Read for BufStream<S> {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        self.inner.read(buf)
-    }
-}
-
-#[unstable(feature = "buf_stream",
-           reason = "unsure about semantics of buffering two directions, \
-                     leading to issues like #17136")]
-impl<S: Read + Write> Write for BufStream<S> {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.inner.inner.get_mut().write(buf)
-    }
-    fn flush(&mut self) -> io::Result<()> {
-        self.inner.inner.get_mut().flush()
-    }
-}
-
-#[unstable(feature = "buf_stream",
-           reason = "unsure about semantics of buffering two directions, \
-                     leading to issues like #17136")]
-impl<S: Write> fmt::Debug for BufStream<S> where S: fmt::Debug {
-    fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
-        let reader = &self.inner;
-        let writer = &self.inner.inner.0;
-        fmt.debug_struct("BufStream")
-            .field("stream", &writer.inner)
-            .field("write_buffer", &format_args!("{}/{}", writer.buf.len(), writer.buf.capacity()))
-            .field("read_buffer",
-                   &format_args!("{}/{}", reader.cap - reader.pos, reader.buf.len()))
-            .finish()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use prelude::v1::*;
     use io::prelude::*;
-    use io::{self, BufReader, BufWriter, BufStream, Cursor, LineWriter, SeekFrom};
+    use io::{self, BufReader, BufWriter, LineWriter, SeekFrom};
+    use sync::atomic::{AtomicUsize, Ordering};
+    use thread;
     use test;
 
     /// A dummy reader intended at testing short-reads propagation.
@@ -729,27 +961,6 @@ mod tests {
         assert_eq!(&w.into_inner().unwrap().into_inner()[..], &[0, 1, 8, 9, 4, 5, 6, 7]);
     }
 
-    // This is just here to make sure that we don't infinite loop in the
-    // newtype struct autoderef weirdness
-    #[test]
-    fn test_buffered_stream() {
-        struct S;
-
-        impl Write for S {
-            fn write(&mut self, b: &[u8]) -> io::Result<usize> { Ok(b.len()) }
-            fn flush(&mut self) -> io::Result<()> { Ok(()) }
-        }
-
-        impl Read for S {
-            fn read(&mut self, _: &mut [u8]) -> io::Result<usize> { Ok(0) }
-        }
-
-        let mut stream = BufStream::new(S);
-        assert_eq!(stream.read(&mut [0; 10]).unwrap(), 0);
-        stream.write(&[0; 10]).unwrap();
-        stream.flush().unwrap();
-    }
-
     #[test]
     fn test_read_until() {
         let inner: &[u8] = &[0, 1, 2, 1, 0];
@@ -868,6 +1079,29 @@ mod tests {
         panic!();
     }
 
+    #[test]
+    fn panic_in_write_doesnt_flush_in_drop() {
+        static WRITES: AtomicUsize = AtomicUsize::new(0);
+
+        struct PanicWriter;
+
+        impl Write for PanicWriter {
+            fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+                WRITES.fetch_add(1, Ordering::SeqCst);
+                panic!();
+            }
+            fn flush(&mut self) -> io::Result<()> { Ok(()) }
+        }
+
+        thread::spawn(|| {
+            let mut writer = BufWriter::new(PanicWriter);
+            let _ = writer.write(b"hello world");
+            let _ = writer.flush();
+        }).join().err().unwrap();
+
+        assert_eq!(WRITES.load(Ordering::SeqCst), 1);
+    }
+
     #[bench]
     fn bench_buffered_reader(b: &mut test::Bencher) {
         b.iter(|| {
@@ -879,14 +1113,6 @@ mod tests {
     fn bench_buffered_writer(b: &mut test::Bencher) {
         b.iter(|| {
             BufWriter::new(io::sink())
-        });
-    }
-
-    #[bench]
-    fn bench_buffered_stream(b: &mut test::Bencher) {
-        let mut buf = Cursor::new(Vec::new());
-        b.iter(|| {
-            BufStream::new(&mut buf);
         });
     }
 }

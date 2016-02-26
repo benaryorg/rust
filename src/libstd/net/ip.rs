@@ -10,39 +10,41 @@
 
 #![unstable(feature = "ip", reason = "extra functionality has not been \
                                       scrutinized to the level that it should \
-                                      be stable")]
-
-use prelude::v1::*;
+                                      be stable",
+            issue = "27709")]
 
 use cmp::Ordering;
-use hash;
 use fmt;
-use libc;
-use sys_common::{AsInner, FromInner};
+use hash;
+use mem;
 use net::{hton, ntoh};
+use sys::net::netc as c;
+use sys_common::{AsInner, FromInner};
 
-/// An IP address, either a IPv4 or IPv6 address.
-#[unstable(feature = "ip_addr", reason = "recent addition")]
+/// An IP address, either an IPv4 or IPv6 address.
+#[stable(feature = "ip_addr", since = "1.7.0")]
 #[derive(Copy, Clone, Eq, PartialEq, Debug, Hash, PartialOrd, Ord)]
 pub enum IpAddr {
     /// Representation of an IPv4 address.
-    V4(Ipv4Addr),
+    #[stable(feature = "ip_addr", since = "1.7.0")]
+    V4(#[stable(feature = "ip_addr", since = "1.7.0")] Ipv4Addr),
     /// Representation of an IPv6 address.
-    V6(Ipv6Addr),
+    #[stable(feature = "ip_addr", since = "1.7.0")]
+    V6(#[stable(feature = "ip_addr", since = "1.7.0")] Ipv6Addr),
 }
 
 /// Representation of an IPv4 address.
 #[derive(Copy)]
 #[stable(feature = "rust1", since = "1.0.0")]
 pub struct Ipv4Addr {
-    inner: libc::in_addr,
+    inner: c::in_addr,
 }
 
 /// Representation of an IPv6 address.
 #[derive(Copy)]
 #[stable(feature = "rust1", since = "1.0.0")]
 pub struct Ipv6Addr {
-    inner: libc::in6_addr,
+    inner: c::in6_addr,
 }
 
 #[allow(missing_docs)]
@@ -64,7 +66,7 @@ impl Ipv4Addr {
     #[stable(feature = "rust1", since = "1.0.0")]
     pub fn new(a: u8, b: u8, c: u8, d: u8) -> Ipv4Addr {
         Ipv4Addr {
-            inner: libc::in_addr {
+            inner: c::in_addr {
                 s_addr: hton(((a as u32) << 24) |
                              ((b as u32) << 16) |
                              ((c as u32) <<  8) |
@@ -86,6 +88,9 @@ impl Ipv4Addr {
     }
 
     /// Returns true if this is a loopback address (127.0.0.0/8).
+    ///
+    /// This property is defined by RFC 6890
+    #[stable(since = "1.7.0", feature = "ip_17")]
     pub fn is_loopback(&self) -> bool {
         self.octets()[0] == 127
     }
@@ -97,6 +102,7 @@ impl Ipv4Addr {
     ///  - 10.0.0.0/8
     ///  - 172.16.0.0/12
     ///  - 192.168.0.0/16
+    #[stable(since = "1.7.0", feature = "ip_17")]
     pub fn is_private(&self) -> bool {
         match (self.octets()[0], self.octets()[1]) {
             (10, _) => true,
@@ -107,6 +113,9 @@ impl Ipv4Addr {
     }
 
     /// Returns true if the address is link-local (169.254.0.0/16).
+    ///
+    /// This property is defined by RFC 6890
+    #[stable(since = "1.7.0", feature = "ip_17")]
     pub fn is_link_local(&self) -> bool {
         self.octets()[0] == 169 && self.octets()[1] == 254
     }
@@ -127,7 +136,9 @@ impl Ipv4Addr {
 
     /// Returns true if this is a multicast address.
     ///
-    /// Multicast addresses have a most significant octet between 224 and 239.
+    /// Multicast addresses have a most significant octet between 224 and 239,
+    /// and is defined by RFC 5771
+    #[stable(since = "1.7.0", feature = "ip_17")]
     pub fn is_multicast(&self) -> bool {
         self.octets()[0] >= 224 && self.octets()[0] <= 239
     }
@@ -135,6 +146,7 @@ impl Ipv4Addr {
     /// Returns true if this is a broadcast address.
     ///
     /// A broadcast address has all octets set to 255 as defined in RFC 919.
+    #[stable(since = "1.7.0", feature = "ip_17")]
     pub fn is_broadcast(&self) -> bool {
         self.octets()[0] == 255 && self.octets()[1] == 255 &&
         self.octets()[2] == 255 && self.octets()[3] == 255
@@ -147,11 +159,12 @@ impl Ipv4Addr {
     /// - 192.0.2.0/24 (TEST-NET-1)
     /// - 198.51.100.0/24 (TEST-NET-2)
     /// - 203.0.113.0/24 (TEST-NET-3)
+    #[stable(since = "1.7.0", feature = "ip_17")]
     pub fn is_documentation(&self) -> bool {
         match(self.octets()[0], self.octets()[1], self.octets()[2], self.octets()[3]) {
-            (192, _, 2, _) => true,
+            (192, 0, 2, _) => true,
             (198, 51, 100, _) => true,
-            (203, _, 113, _) => true,
+            (203, 0, 113, _) => true,
             _ => false
         }
     }
@@ -178,6 +191,7 @@ impl Ipv4Addr {
 }
 
 #[stable(feature = "rust1", since = "1.0.0")]
+#[allow(deprecated)]
 impl fmt::Display for IpAddr {
     fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
         match *self {
@@ -234,15 +248,15 @@ impl PartialOrd for Ipv4Addr {
 #[stable(feature = "rust1", since = "1.0.0")]
 impl Ord for Ipv4Addr {
     fn cmp(&self, other: &Ipv4Addr) -> Ordering {
-        self.inner.s_addr.cmp(&other.inner.s_addr)
+        self.octets().cmp(&other.octets())
     }
 }
 
-impl AsInner<libc::in_addr> for Ipv4Addr {
-    fn as_inner(&self) -> &libc::in_addr { &self.inner }
+impl AsInner<c::in_addr> for Ipv4Addr {
+    fn as_inner(&self) -> &c::in_addr { &self.inner }
 }
-impl FromInner<libc::in_addr> for Ipv4Addr {
-    fn from_inner(addr: libc::in_addr) -> Ipv4Addr {
+impl FromInner<c::in_addr> for Ipv4Addr {
+    fn from_inner(addr: c::in_addr) -> Ipv4Addr {
         Ipv4Addr { inner: addr }
     }
 }
@@ -269,33 +283,46 @@ impl Ipv6Addr {
     #[stable(feature = "rust1", since = "1.0.0")]
     pub fn new(a: u16, b: u16, c: u16, d: u16, e: u16, f: u16, g: u16,
                h: u16) -> Ipv6Addr {
-        Ipv6Addr {
-            inner: libc::in6_addr {
-                s6_addr: [hton(a), hton(b), hton(c), hton(d),
-                          hton(e), hton(f), hton(g), hton(h)]
-            }
-        }
+        let mut addr: c::in6_addr = unsafe { mem::zeroed() };
+        addr.s6_addr = [(a >> 8) as u8, a as u8,
+                        (b >> 8) as u8, b as u8,
+                        (c >> 8) as u8, c as u8,
+                        (d >> 8) as u8, d as u8,
+                        (e >> 8) as u8, e as u8,
+                        (f >> 8) as u8, f as u8,
+                        (g >> 8) as u8, g as u8,
+                        (h >> 8) as u8, h as u8];
+        Ipv6Addr { inner: addr }
     }
 
     /// Returns the eight 16-bit segments that make up this address.
     #[stable(feature = "rust1", since = "1.0.0")]
     pub fn segments(&self) -> [u16; 8] {
-        [ntoh(self.inner.s6_addr[0]),
-         ntoh(self.inner.s6_addr[1]),
-         ntoh(self.inner.s6_addr[2]),
-         ntoh(self.inner.s6_addr[3]),
-         ntoh(self.inner.s6_addr[4]),
-         ntoh(self.inner.s6_addr[5]),
-         ntoh(self.inner.s6_addr[6]),
-         ntoh(self.inner.s6_addr[7])]
+        let arr = &self.inner.s6_addr;
+        [
+            (arr[0] as u16) << 8 | (arr[1] as u16),
+            (arr[2] as u16) << 8 | (arr[3] as u16),
+            (arr[4] as u16) << 8 | (arr[5] as u16),
+            (arr[6] as u16) << 8 | (arr[7] as u16),
+            (arr[8] as u16) << 8 | (arr[9] as u16),
+            (arr[10] as u16) << 8 | (arr[11] as u16),
+            (arr[12] as u16) << 8 | (arr[13] as u16),
+            (arr[14] as u16) << 8 | (arr[15] as u16),
+        ]
     }
 
     /// Returns true for the special 'unspecified' address ::.
+    ///
+    /// This property is defined in RFC 6890.
+    #[stable(since = "1.7.0", feature = "ip_17")]
     pub fn is_unspecified(&self) -> bool {
         self.segments() == [0, 0, 0, 0, 0, 0, 0, 0]
     }
 
     /// Returns true if this is a loopback address (::1).
+    ///
+    /// This property is defined in RFC 6890.
+    #[stable(since = "1.7.0", feature = "ip_17")]
     pub fn is_loopback(&self) -> bool {
         self.segments() == [0, 0, 0, 0, 0, 0, 0, 1]
     }
@@ -367,7 +394,9 @@ impl Ipv6Addr {
 
     /// Returns true if this is a multicast address.
     ///
-    /// Multicast addresses have the form ff00::/8.
+    /// Multicast addresses have the form ff00::/8, and this property is defined
+    /// by RFC 3956.
+    #[stable(since = "1.7.0", feature = "ip_17")]
     pub fn is_multicast(&self) -> bool {
         (self.segments()[0] & 0xff00) == 0xff00
     }
@@ -437,17 +466,19 @@ impl fmt::Display for Ipv6Addr {
                 let (zeros_at, zeros_len) = find_zero_slice(&self.segments());
 
                 if zeros_len > 1 {
-                    fn fmt_subslice(segments: &[u16]) -> String {
-                        segments
-                            .iter()
-                            .map(|&seg| format!("{:x}", seg))
-                            .collect::<Vec<String>>()
-                            .connect(":")
+                    fn fmt_subslice(segments: &[u16], fmt: &mut fmt::Formatter) -> fmt::Result {
+                        if !segments.is_empty() {
+                            try!(write!(fmt, "{:x}", segments[0]));
+                            for &seg in &segments[1..] {
+                                try!(write!(fmt, ":{:x}", seg));
+                            }
+                        }
+                        Ok(())
                     }
 
-                    write!(fmt, "{}::{}",
-                           fmt_subslice(&self.segments()[..zeros_at]),
-                           fmt_subslice(&self.segments()[zeros_at + zeros_len..]))
+                    try!(fmt_subslice(&self.segments()[..zeros_at], fmt));
+                    try!(fmt.write_str("::"));
+                    fmt_subslice(&self.segments()[zeros_at + zeros_len..], fmt)
                 } else {
                     let &[a, b, c, d, e, f, g, h] = &self.segments();
                     write!(fmt, "{:x}:{:x}:{:x}:{:x}:{:x}:{:x}:{:x}:{:x}",
@@ -497,15 +528,15 @@ impl PartialOrd for Ipv6Addr {
 #[stable(feature = "rust1", since = "1.0.0")]
 impl Ord for Ipv6Addr {
     fn cmp(&self, other: &Ipv6Addr) -> Ordering {
-        self.inner.s6_addr.cmp(&other.inner.s6_addr)
+        self.segments().cmp(&other.segments())
     }
 }
 
-impl AsInner<libc::in6_addr> for Ipv6Addr {
-    fn as_inner(&self) -> &libc::in6_addr { &self.inner }
+impl AsInner<c::in6_addr> for Ipv6Addr {
+    fn as_inner(&self) -> &c::in6_addr { &self.inner }
 }
-impl FromInner<libc::in6_addr> for Ipv6Addr {
-    fn from_inner(addr: libc::in6_addr) -> Ipv6Addr {
+impl FromInner<c::in6_addr> for Ipv6Addr {
+    fn from_inner(addr: c::in6_addr) -> Ipv6Addr {
         Ipv6Addr { inner: addr }
     }
 }
@@ -514,7 +545,6 @@ impl FromInner<libc::in6_addr> for Ipv6Addr {
 #[cfg(test)]
 mod tests {
     use prelude::v1::*;
-    use io;
     use net::*;
     use net::Ipv6MulticastScope::*;
     use net::test::{tsa, sa6, sa4};
@@ -593,9 +623,17 @@ mod tests {
     fn test_from_str_socket_addr() {
         assert_eq!(Ok(sa4(Ipv4Addr::new(77, 88, 21, 11), 80)),
                    "77.88.21.11:80".parse());
+        assert_eq!(Ok(SocketAddrV4::new(Ipv4Addr::new(77, 88, 21, 11), 80)),
+                   "77.88.21.11:80".parse());
         assert_eq!(Ok(sa6(Ipv6Addr::new(0x2a02, 0x6b8, 0, 1, 0, 0, 0, 1), 53)),
                    "[2a02:6b8:0:1::1]:53".parse());
+        assert_eq!(Ok(SocketAddrV6::new(Ipv6Addr::new(0x2a02, 0x6b8, 0, 1,
+                                                      0, 0, 0, 1), 53, 0, 0)),
+                   "[2a02:6b8:0:1::1]:53".parse());
         assert_eq!(Ok(sa6(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0x7F00, 1), 22)),
+                   "[::127.0.0.1]:22".parse());
+        assert_eq!(Ok(SocketAddrV6::new(Ipv6Addr::new(0, 0, 0, 0, 0, 0,
+                                                      0x7F00, 1), 22, 0, 0)),
                    "[::127.0.0.1]:22".parse());
 
         // without port
@@ -694,11 +732,15 @@ mod tests {
         check(&[127, 1, 2, 3],       false, true,  false, false, false, false,    false,  false);
         check(&[172, 31, 254, 253],  false, false, true,  false, false, false,    false,  false);
         check(&[169, 254, 253, 242], false, false, false, true,  false, false,    false,  false);
+        check(&[192, 0, 2, 183],     false, false, false, false, false, false,    false,  true);
+        check(&[192, 1, 2, 183],     false, false, false, false, true,  false,    false,  false);
         check(&[192, 168, 254, 253], false, false, true,  false, false, false,    false,  false);
+        check(&[198, 51, 100, 0],    false, false, false, false, false, false,    false,  true);
+        check(&[203, 0, 113, 0],     false, false, false, false, false, false,    false,  true);
+        check(&[203, 2, 113, 0],     false, false, false, false, true,  false,    false,  false);
         check(&[224, 0, 0, 0],       false, false, false, false, true,  true,     false,  false);
         check(&[239, 255, 255, 255], false, false, false, false, true,  true,     false,  false);
-        check(&[255, 255, 255, 255], false, false, false, false, false, false,    true,  false);
-        check(&[198, 51, 100, 0],    false, false, false, false, false, false,    false,  true);
+        check(&[255, 255, 255, 255], false, false, false, false, false, false,    true,   false);
     }
 
     #[test]
@@ -772,5 +814,12 @@ mod tests {
     fn test_int_to_ipv4() {
         let a = Ipv4Addr::new(127, 0, 0, 1);
         assert_eq!(Ipv4Addr::from(2130706433), a);
+    }
+
+    #[test]
+    fn ord() {
+        assert!(Ipv4Addr::new(100, 64, 3, 3) < Ipv4Addr::new(192, 0, 2, 2));
+        assert!("2001:db8:f00::1002".parse::<Ipv6Addr>().unwrap() <
+                "2001:db8:f00::2001".parse::<Ipv6Addr>().unwrap());
     }
 }

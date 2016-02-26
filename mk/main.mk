@@ -13,7 +13,7 @@
 ######################################################################
 
 # The version number
-CFG_RELEASE_NUM=1.2.0
+CFG_RELEASE_NUM=1.8.0
 
 # An optional number to put after the label, e.g. '.2' -> '-beta.2'
 # NB Make sure it starts with a dot to conform to semver pre-release
@@ -22,7 +22,7 @@ CFG_PRERELEASE_VERSION=.1
 
 # Append a version-dependent hash to each library, so we can install different
 # versions in the same place
-CFG_FILENAME_EXTRA=$(shell printf '%s' $(CFG_RELEASE) | $(CFG_HASH_COMMAND))
+CFG_FILENAME_EXTRA=$(shell printf '%s' $(CFG_RELEASE)$(CFG_EXTRA_FILENAME) | $(CFG_HASH_COMMAND))
 
 ifeq ($(CFG_RELEASE_CHANNEL),stable)
 # This is the normal semver version string, e.g. "0.12.0", "0.12.0-nightly"
@@ -74,9 +74,6 @@ ifneq ($(wildcard $(subst $(SPACE),\$(SPACE),$(CFG_GIT_DIR))),)
 endif
 endif
 
-CFG_BUILD_DATE = $(shell date +%F)
-CFG_VERSION += (built $(CFG_BUILD_DATE))
-
 # Windows exe's need numeric versions - don't use anything but
 # numbers and dots here
 CFG_VERSION_WIN = $(CFG_RELEASE_NUM)
@@ -114,8 +111,7 @@ CFG_RUSTC_FLAGS := $(RUSTFLAGS)
 CFG_GCCISH_CFLAGS :=
 CFG_GCCISH_LINK_FLAGS :=
 
-# Turn off broken quarantine (see jemalloc/jemalloc#161)
-CFG_JEMALLOC_FLAGS := --disable-fill
+CFG_JEMALLOC_FLAGS :=
 
 ifdef CFG_DISABLE_OPTIMIZE
   $(info cfg: disabling rustc optimization (CFG_DISABLE_OPTIMIZE))
@@ -130,9 +126,7 @@ CFG_JEMALLOC_FLAGS += $(JEMALLOC_FLAGS)
 
 ifdef CFG_ENABLE_DEBUG_ASSERTIONS
   $(info cfg: enabling debug assertions (CFG_ENABLE_DEBUG_ASSERTIONS))
-  CFG_RUSTC_FLAGS += --cfg debug -C debug-assertions=on
-else
-  CFG_RUSTC_FLAGS += --cfg ndebug
+  CFG_RUSTC_FLAGS += -C debug-assertions=on
 endif
 
 ifdef CFG_ENABLE_DEBUGINFO
@@ -155,7 +149,7 @@ endif
 ifdef TRACE
   CFG_RUSTC_FLAGS += -Z trace
 endif
-ifdef CFG_ENABLE_RPATH
+ifndef CFG_DISABLE_RPATH
 CFG_RUSTC_FLAGS += -C rpath
 endif
 
@@ -168,21 +162,24 @@ endif
 # that the snapshot will be generated with a statically linked rustc so we only
 # have to worry about the distribution of one file (with its native dynamic
 # dependencies)
-RUSTFLAGS_STAGE0 += -C prefer-dynamic
+RUSTFLAGS_STAGE0 += -C prefer-dynamic -C no-stack-check
 RUSTFLAGS_STAGE1 += -C prefer-dynamic
 RUST_LIB_FLAGS_ST2 += -C prefer-dynamic
 RUST_LIB_FLAGS_ST3 += -C prefer-dynamic
 
 # Landing pads require a lot of codegen. We can get through bootstrapping faster
 # by not emitting them.
-RUSTFLAGS_STAGE0 += -Z no-landing-pads
+
+ifdef CFG_DISABLE_STAGE0_LANDING_PADS
+  RUSTFLAGS_STAGE0 += -Z no-landing-pads
+endif
 
 # platform-specific auto-configuration
 include $(CFG_SRC_DIR)mk/platform.mk
 
 # Run the stage1/2 compilers under valgrind
 ifdef VALGRIND_COMPILE
-  CFG_VALGRIND_COMPILE :=$(CFG_VALGRIND)
+  CFG_VALGRIND_COMPILE := $(CFG_VALGRIND)
 else
   CFG_VALGRIND_COMPILE :=
 endif
@@ -200,6 +197,7 @@ endif
 
 ifdef CFG_ENABLE_VALGRIND
   $(info cfg: enabling valgrind (CFG_ENABLE_VALGRIND))
+  CFG_JEMALLOC_FLAGS += --enable-valgrind
 else
   CFG_VALGRIND :=
 endif
@@ -274,9 +272,17 @@ endif
 # LLVM macros
 ######################################################################
 
-# FIXME: x86-ism
-LLVM_COMPONENTS=x86 arm aarch64 mips powerpc ipo bitreader bitwriter linker asmparser mcjit \
+LLVM_OPTIONAL_COMPONENTS=x86 arm aarch64 mips powerpc pnacl
+LLVM_REQUIRED_COMPONENTS=ipo bitreader bitwriter linker asmparser mcjit \
                 interpreter instrumentation
+
+ifneq ($(CFG_LLVM_ROOT),)
+# Ensure we only try to link targets that the installed LLVM actually has:
+LLVM_COMPONENTS := $(filter $(shell $(CFG_LLVM_ROOT)/bin/llvm-config$(X_$(CFG_BUILD)) --components),\
+			$(LLVM_OPTIONAL_COMPONENTS)) $(LLVM_REQUIRED_COMPONENTS)
+else
+LLVM_COMPONENTS := $(LLVM_OPTIONAL_COMPONENTS) $(LLVM_REQUIRED_COMPONENTS)
+endif
 
 # Only build these LLVM tools
 LLVM_TOOLS=bugpoint llc llvm-ar llvm-as llvm-dis llvm-mc opt llvm-extract
@@ -299,8 +305,7 @@ LLVM_VERSION_$(1)=$$(shell "$$(LLVM_CONFIG_$(1))" --version)
 LLVM_BINDIR_$(1)=$$(shell "$$(LLVM_CONFIG_$(1))" --bindir)
 LLVM_INCDIR_$(1)=$$(shell "$$(LLVM_CONFIG_$(1))" --includedir)
 LLVM_LIBDIR_$(1)=$$(shell "$$(LLVM_CONFIG_$(1))" --libdir)
-LLVM_LIBDIR_RUSTFLAGS_$(1)=-L "$$(LLVM_LIBDIR_$(1))"
-LLVM_LIBS_$(1)=$$(shell "$$(LLVM_CONFIG_$(1))" --libs $$(LLVM_COMPONENTS))
+LLVM_LIBDIR_RUSTFLAGS_$(1)=-L native="$$(LLVM_LIBDIR_$(1))"
 LLVM_LDFLAGS_$(1)=$$(shell "$$(LLVM_CONFIG_$(1))" --ldflags)
 ifeq ($$(findstring freebsd,$(1)),freebsd)
 # On FreeBSD, it may search wrong headers (that are for pre-installed LLVM),
@@ -313,6 +318,8 @@ LLVM_HOST_TRIPLE_$(1)=$$(shell "$$(LLVM_CONFIG_$(1))" --host-target)
 
 LLVM_AS_$(1)=$$(CFG_LLVM_INST_DIR_$(1))/bin/llvm-as$$(X_$(1))
 LLC_$(1)=$$(CFG_LLVM_INST_DIR_$(1))/bin/llc$$(X_$(1))
+
+LLVM_ALL_COMPONENTS_$(1)=$$(shell "$$(LLVM_CONFIG_$(1))" --components)
 
 endef
 
@@ -327,6 +334,7 @@ $(foreach host,$(CFG_HOST), \
 # exported
 
 export CFG_SRC_DIR
+export CFG_SRC_DIR_RELATIVE
 export CFG_BUILD_DIR
 ifdef CFG_VER_DATE
 export CFG_VER_DATE
@@ -334,7 +342,6 @@ endif
 ifdef CFG_VER_HASH
 export CFG_VER_HASH
 endif
-export CFG_BUILD_DATE
 export CFG_VERSION
 export CFG_VERSION_WIN
 export CFG_RELEASE
@@ -354,6 +361,9 @@ export CFG_DISABLE_UNSTABLE_FEATURES
 export RUSTC_BOOTSTRAP_KEY:=$(CFG_BOOTSTRAP_KEY)
 endif
 export CFG_BOOTSTRAP_KEY
+ifdef CFG_MUSL_ROOT
+export CFG_MUSL_ROOT
+endif
 
 ######################################################################
 # Per-stage targets and runner
@@ -375,18 +385,30 @@ define SREQ
 # Destinations of artifacts for the host compiler
 HROOT$(1)_H_$(3) = $(3)/stage$(1)
 HBIN$(1)_H_$(3) = $$(HROOT$(1)_H_$(3))/bin
+
 ifeq ($$(CFG_WINDOWSY_$(3)),1)
-HLIB$(1)_H_$(3) = $$(HROOT$(1)_H_$(3))/$$(CFG_LIBDIR_RELATIVE)
-else
+# On Windows we always store host runtime libraries in the 'bin' directory because
+# there's no rpath. Target libraries go under $CFG_LIBDIR_RELATIVE (usually 'lib').
+HLIB_RELATIVE$(1)_H_$(3) = bin
+TROOT$(1)_T_$(2)_H_$(3) = $$(HROOT$(1)_H_$(3))/$$(CFG_LIBDIR_RELATIVE)/rustlib/$(2)
+# Remove the next 3 lines after a snapshot
 ifeq ($(1),0)
-HLIB$(1)_H_$(3) = $$(HROOT$(1)_H_$(3))/lib
-else
-HLIB$(1)_H_$(3) = $$(HROOT$(1)_H_$(3))/$$(CFG_LIBDIR_RELATIVE)
-endif
+RUSTFLAGS_STAGE0 += -L $$(TROOT$(1)_T_$(2)_H_$(3))/lib
 endif
 
-# Destinations of artifacts for target architectures
+else
+
+ifeq ($(1),0)
+HLIB_RELATIVE$(1)_H_$(3) = lib
+else
+HLIB_RELATIVE$(1)_H_$(3) = $$(CFG_LIBDIR_RELATIVE)
+endif
 TROOT$(1)_T_$(2)_H_$(3) = $$(HLIB$(1)_H_$(3))/rustlib/$(2)
+
+endif
+HLIB$(1)_H_$(3) = $$(HROOT$(1)_H_$(3))/$$(HLIB_RELATIVE$(1)_H_$(3))
+
+# Destinations of artifacts for target architectures
 TBIN$(1)_T_$(2)_H_$(3) = $$(TROOT$(1)_T_$(2)_H_$(3))/bin
 TLIB$(1)_T_$(2)_H_$(3) = $$(TROOT$(1)_T_$(2)_H_$(3))/lib
 
@@ -403,7 +425,7 @@ endif
 # Prerequisites for using the stageN compiler to build target artifacts
 TSREQ$(1)_T_$(2)_H_$(3) = \
 	$$(HSREQ$(1)_H_$(3)) \
-	$$(foreach obj,$$(INSTALLED_OBJECTS_$(2)),\
+	$$(foreach obj,$$(REQUIRED_OBJECTS_$(2)),\
 		$$(TLIB$(1)_T_$(2)_H_$(3))/$$(obj))
 
 # Prerequisites for a working stageN compiler and libraries, for a specific
@@ -464,7 +486,7 @@ endif
 endif
 
 LD_LIBRARY_PATH_ENV_HOSTDIR$(1)_T_$(2)_H_$(3) := \
-    $$(CURDIR)/$$(HLIB$(1)_H_$(3))
+    $$(CURDIR)/$$(HLIB$(1)_H_$(3)):$$(CFG_LLVM_INST_DIR_$(3))/lib
 LD_LIBRARY_PATH_ENV_TARGETDIR$(1)_T_$(2)_H_$(3) := \
     $$(CURDIR)/$$(TLIB1_T_$(2)_H_$(CFG_BUILD))
 
@@ -498,14 +520,6 @@ STAGE$(1)_T_$(2)_H_$(3) := \
 	$$(Q)$$(RPATH_VAR$(1)_T_$(2)_H_$(3)) \
 		$$(call CFG_RUN_TARG_$(3),$(1), \
 		$$(CFG_VALGRIND_COMPILE$(1)) \
-		$$(HBIN$(1)_H_$(3))/rustc$$(X_$(3)) \
-		--cfg $$(CFGFLAG$(1)_T_$(2)_H_$(3)) \
-		$$(CFG_RUSTC_FLAGS) $$(EXTRAFLAGS_STAGE$(1)) --target=$(2)) \
-                $$(RUSTC_FLAGS_$(2))
-
-PERF_STAGE$(1)_T_$(2)_H_$(3) := \
-	$$(Q)$$(call CFG_RUN_TARG_$(3),$(1), \
-		$$(CFG_PERF_TOOL) \
 		$$(HBIN$(1)_H_$(3))/rustc$$(X_$(3)) \
 		--cfg $$(CFGFLAG$(1)_T_$(2)_H_$(3)) \
 		$$(CFG_RUSTC_FLAGS) $$(EXTRAFLAGS_STAGE$(1)) --target=$(2)) \

@@ -8,8 +8,9 @@
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
 
+// ignore-emscripten no threads support
 
-#![feature(rand, core)]
+#![feature(rand, num_bits_bytes)]
 #![feature(const_fn)]
 
 use std::sync::atomic::{AtomicUsize, Ordering};

@@ -16,12 +16,10 @@ pub fn opts() -> TargetOptions {
         linker: "cc".to_string(),
         dynamic_linking: true,
         executables: true,
-        morestack: false,
         linker_is_gnu: true,
         has_rpath: true,
         position_independent_executables: true,
-        pre_link_args: vec!(
-        ),
+        exe_allocation_crate: "alloc_system".to_string(),
 
         .. Default::default()
     }

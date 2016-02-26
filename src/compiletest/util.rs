@@ -21,9 +21,12 @@ const OS_TABLE: &'static [(&'static str, &'static str)] = &[
     ("ios", "ios"),
     ("linux", "linux"),
     ("mingw32", "windows"),
+    ("netbsd", "netbsd"),
     ("openbsd", "openbsd"),
     ("win32", "windows"),
     ("windows", "windows"),
+    ("solaris", "solaris"),
+    ("emscripten", "emscripten"),
 ];
 
 const ARCH_TABLE: &'static [(&'static str, &'static str)] = &[
@@ -37,10 +40,12 @@ const ARCH_TABLE: &'static [(&'static str, &'static str)] = &[
     ("mips", "mips"),
     ("msp430", "msp430"),
     ("powerpc", "powerpc"),
+    ("powerpc64", "powerpc64"),
     ("s390x", "systemz"),
     ("sparc", "sparc"),
     ("x86_64", "x86_64"),
     ("xcore", "xcore"),
+    ("asmjs", "asmjs"),
 ];
 
 pub fn get_os(triple: &str) -> &'static str {
@@ -72,7 +77,7 @@ pub fn make_new_path(path: &str) -> String {
         Ok(curr) => {
             format!("{}{}{}", path, path_div(), curr)
         }
-        Err(..) => path.to_string()
+        Err(..) => path.to_owned()
     }
 }
 

@@ -8,10 +8,7 @@
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
 
-
-#![feature(unboxed_closures, core)]
-
-use std::ops::FnMut;
+#![feature(unboxed_closures, fn_traits)]
 
 struct S;
 
@@ -38,6 +35,6 @@ fn call_box(f: &mut FnMut(i32) -> i32, x: i32) -> i32 {
 fn main() {
     let x = call_it(S, 1);
     let y = call_box(&mut S, 1);
-    assert!(x == 4);
-    assert!(y == 4);
+    assert_eq!(x, 4);
+    assert_eq!(y, 4);
 }

@@ -14,7 +14,7 @@
 # would create a variable HOST_i686-darwin-macos with the value
 # i386.
 define DEF_HOST_VAR
-  HOST_$(1) = $(subst i686,i386,$(word 1,$(subst -, ,$(1))))
+  HOST_$(1) = $(patsubst i%86,i386,$(word 1,$(subst -, ,$(1))))
 endef
 $(foreach t,$(CFG_TARGET),$(eval $(call DEF_HOST_VAR,$(t))))
 $(foreach t,$(CFG_TARGET),$(info cfg: host for $(t) is $(HOST_$(t))))
@@ -64,31 +64,18 @@ define DEF_GOOD_VALGRIND
   ifeq ($(OSTYPE_$(1)),unknown-linux-gnu)
     GOOD_VALGRIND_$(1) = 1
   endif
-  ifneq (,$(filter $(OSTYPE_$(1)),darwin freebsd))
-    ifeq (HOST_$(1),x86_64)
+  ifneq (,$(filter $(OSTYPE_$(1)),apple-darwin freebsd))
+    ifeq ($(HOST_$(1)),x86_64)
       GOOD_VALGRIND_$(1) = 1
     endif
   endif
+  ifdef GOOD_VALGRIND_$(t)
+    $$(info cfg: have good valgrind for $(t))
+  else
+    $$(info cfg: no good valgrind for $(t))
+  endif
 endef
 $(foreach t,$(CFG_TARGET),$(eval $(call DEF_GOOD_VALGRIND,$(t))))
-$(foreach t,$(CFG_TARGET),$(info cfg: good valgrind for $(t) is $(GOOD_VALGRIND_$(t))))
-
-ifneq ($(findstring linux,$(CFG_OSTYPE)),)
-  ifdef CFG_PERF
-    ifneq ($(CFG_PERF_WITH_LOGFD),)
-        CFG_PERF_TOOL := $(CFG_PERF) stat -r 3 --log-fd 2
-    else
-        CFG_PERF_TOOL := $(CFG_PERF) stat -r 3
-    endif
-  else
-    ifdef CFG_VALGRIND
-      CFG_PERF_TOOL := \
-        $(CFG_VALGRIND) --tool=cachegrind --cache-sim=yes --branch-sim=yes
-    else
-      CFG_PERF_TOOL := /usr/bin/time --verbose
-    endif
-  endif
-endif
 
 AR := ar
 
@@ -113,8 +100,10 @@ CFG_RLIB_GLOB=lib$(1)-*.rlib
 include $(wildcard $(CFG_SRC_DIR)mk/cfg/*.mk)
 
 define ADD_INSTALLED_OBJECTS
-  INSTALLED_OBJECTS_$(1) += $$(call CFG_STATIC_LIB_NAME_$(1),morestack) \
-                            $$(call CFG_STATIC_LIB_NAME_$(1),compiler-rt)
+  INSTALLED_OBJECTS_$(1) += $$(CFG_INSTALLED_OBJECTS_$(1))
+  REQUIRED_OBJECTS_$(1) += $$(CFG_THIRD_PARTY_OBJECTS_$(1))
+  INSTALLED_OBJECTS_$(1) += $$(call CFG_STATIC_LIB_NAME_$(1),compiler-rt)
+  REQUIRED_OBJECTS_$(1) += $$(call CFG_STATIC_LIB_NAME_$(1),compiler-rt)
 endef
 
 $(foreach target,$(CFG_TARGET), \
@@ -187,21 +176,25 @@ define CFG_MAKE_TOOLCHAIN
   endif
 
   CFG_COMPILE_C_$(1) = $$(CC_$(1)) \
+        $$(CFLAGS) \
         $$(CFG_GCCISH_CFLAGS) \
         $$(CFG_GCCISH_CFLAGS_$(1)) \
         -c $$(call CFG_CC_OUTPUT_$(1),$$(1)) $$(2)
   CFG_LINK_C_$(1) = $$(CC_$(1)) \
+        $$(LDFLAGS) \
         $$(CFG_GCCISH_LINK_FLAGS) -o $$(1) \
         $$(CFG_GCCISH_LINK_FLAGS_$(1)) \
         $$(CFG_GCCISH_DEF_FLAG_$(1))$$(3) $$(2) \
         $$(call CFG_INSTALL_NAME_$(1),$$(4))
   CFG_COMPILE_CXX_$(1) = $$(CXX_$(1)) \
+        $$(CXXFLAGS) \
         $$(CFG_GCCISH_CFLAGS) \
         $$(CFG_GCCISH_CXXFLAGS) \
         $$(CFG_GCCISH_CFLAGS_$(1)) \
         $$(CFG_GCCISH_CXXFLAGS_$(1)) \
         -c $$(call CFG_CC_OUTPUT_$(1),$$(1)) $$(2)
   CFG_LINK_CXX_$(1) = $$(CXX_$(1)) \
+        $$(LDFLAGS) \
         $$(CFG_GCCISH_LINK_FLAGS) -o $$(1) \
         $$(CFG_GCCISH_LINK_FLAGS_$(1)) \
         $$(CFG_GCCISH_DEF_FLAG_$(1))$$(3) $$(2) \

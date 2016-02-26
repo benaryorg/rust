@@ -8,26 +8,36 @@
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
 
-// Do not remove on snapshot creation. Needed for bootstrap. (Issue #22364)
-#![cfg_attr(stage0, feature(custom_attribute))]
+#![deny(warnings)]
 
+#![feature(as_unsafe_cell)]
+#![feature(borrow_state)]
 #![feature(box_syntax)]
-#![feature(unboxed_closures)]
-#![feature(core)]
-#![feature(const_fn)]
-#![feature(test)]
-#![feature(rand)]
-#![feature(unicode)]
-#![feature(std_misc)]
-#![feature(libc)]
-#![feature(hash)]
-#![feature(unique)]
-#![feature(step_by)]
-#![feature(slice_patterns)]
-#![feature(float_from_str_radix)]
 #![feature(cell_extras)]
-#![feature(iter_empty)]
-#![feature(iter_once)]
+#![feature(const_fn)]
+#![feature(core_float)]
+#![feature(core_private_bignum)]
+#![feature(core_private_diy_float)]
+#![feature(dec2flt)]
+#![feature(decode_utf16)]
+#![feature(fixed_size_array)]
+#![feature(float_extras)]
+#![feature(flt2dec)]
+#![feature(fmt_radix)]
+#![feature(iter_arith)]
+#![feature(iter_arith)]
+#![feature(libc)]
+#![feature(nonzero)]
+#![feature(peekable_is_empty)]
+#![feature(ptr_as_ref)]
+#![feature(rand)]
+#![feature(raw)]
+#![feature(slice_patterns)]
+#![feature(step_by)]
+#![feature(test)]
+#![feature(unboxed_closures)]
+#![feature(unicode)]
+#![feature(unique)]
 
 extern crate core;
 extern crate test;
@@ -36,12 +46,15 @@ extern crate rustc_unicode;
 extern crate rand;
 
 mod any;
+mod array;
 mod atomic;
 mod cell;
 mod char;
+mod clone;
 mod cmp;
 mod fmt;
 mod hash;
+mod intrinsics;
 mod iter;
 mod mem;
 mod nonzero;

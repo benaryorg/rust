@@ -47,6 +47,8 @@ mod char {
         //~^ ERROR user-defined types or type parameters cannot shadow the primitive types
         use super::bool_ as bool;
         //~^ ERROR user-defined types or type parameters cannot shadow the primitive types
+        use super::{bool_ as str};
+        //~^ ERROR user-defined types or type parameters cannot shadow the primitive types
         use super::char_ as char;
     }
 }
@@ -60,7 +62,7 @@ fn usize<'usize>(usize: &'usize usize) -> &'usize usize { usize }
 fn main() {
     let bool = true;
     match bool {
-        str @ true => if str { i32 as i64 } else { 0 },
+        str @ true => if str { i32 as i64 } else { i64 },
         false => i64,
-    }
+    };
 }

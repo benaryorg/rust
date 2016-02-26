@@ -8,9 +8,11 @@
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
 
-#![unstable(feature = "std_misc",
+#![unstable(feature = "semaphore",
             reason = "the interaction between semaphores and the acquisition/release \
-                      of resources is currently unclear")]
+                      of resources is currently unclear",
+            issue = "27798")]
+#![allow(deprecated)]
 
 use ops::Drop;
 use sync::{Mutex, Condvar};
@@ -25,7 +27,8 @@ use sync::{Mutex, Condvar};
 /// # Examples
 ///
 /// ```
-/// # #![feature(std_misc)]
+/// #![feature(semaphore)]
+///
 /// use std::sync::Semaphore;
 ///
 /// // Create a semaphore that represents 5 resources
@@ -43,6 +46,13 @@ use sync::{Mutex, Condvar};
 /// // Release our initially acquired resource
 /// sem.release();
 /// ```
+#[rustc_deprecated(since = "1.7.0",
+                   reason = "easily confused with system semaphores and not \
+                             used enough to pull its weight")]
+#[unstable(feature = "semaphore",
+           reason = "the interaction between semaphores and the acquisition/release \
+                     of resources is currently unclear",
+           issue = "27798")]
 pub struct Semaphore {
     lock: Mutex<isize>,
     cvar: Condvar,
@@ -50,10 +60,24 @@ pub struct Semaphore {
 
 /// An RAII guard which will release a resource acquired from a semaphore when
 /// dropped.
+#[rustc_deprecated(since = "1.7.0",
+                   reason = "easily confused with system semaphores and not \
+                             used enough to pull its weight")]
+#[unstable(feature = "semaphore",
+           reason = "the interaction between semaphores and the acquisition/release \
+                     of resources is currently unclear",
+           issue = "27798")]
 pub struct SemaphoreGuard<'a> {
     sem: &'a Semaphore,
 }
 
+#[rustc_deprecated(since = "1.7.0",
+                   reason = "easily confused with system semaphores and not \
+                             used enough to pull its weight")]
+#[unstable(feature = "semaphore",
+           reason = "the interaction between semaphores and the acquisition/release \
+                     of resources is currently unclear",
+           issue = "27798")]
 impl Semaphore {
     /// Creates a new semaphore with the initial count specified.
     ///

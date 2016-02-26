@@ -122,18 +122,16 @@ pub use self::Heap::*;
 use llvm::{BasicBlockRef, ValueRef};
 use trans::base;
 use trans::build;
-use trans::callee;
 use trans::common;
-use trans::common::{Block, FunctionContext, ExprId, NodeIdAndSpan};
+use trans::common::{Block, FunctionContext, NodeIdAndSpan, LandingPad};
+use trans::datum::{Datum, Lvalue};
 use trans::debuginfo::{DebugLoc, ToDebugLoc};
-use trans::declare;
 use trans::glue;
 use middle::region;
 use trans::type_::Type;
 use middle::ty::{self, Ty};
 use std::fmt;
 use syntax::ast;
-use util::ppaux::Repr;
 
 pub struct CleanupScope<'blk, 'tcx: 'blk> {
     // The id of this cleanup scope. If the id is None,
@@ -187,20 +185,26 @@ impl<'blk, 'tcx: 'blk> fmt::Debug for CleanupScopeKind<'blk, 'tcx> {
 
 #[derive(Copy, Clone, PartialEq, Debug)]
 pub enum EarlyExitLabel {
-    UnwindExit,
+    UnwindExit(UnwindKind),
     ReturnExit,
     LoopExit(ast::NodeId, usize)
+}
+
+#[derive(Copy, Clone, Debug)]
+pub enum UnwindKind {
+    LandingPad,
+    CleanupPad(ValueRef),
 }
 
 #[derive(Copy, Clone)]
 pub struct CachedEarlyExit {
     label: EarlyExitLabel,
     cleanup_block: BasicBlockRef,
+    last_cleanup: usize,
 }
 
 pub trait Cleanup<'tcx> {
     fn must_unwind(&self) -> bool;
-    fn clean_on_unwind(&self) -> bool;
     fn is_lifetime_end(&self) -> bool;
     fn trans<'blk>(&self,
                    bcx: Block<'blk, 'tcx>,
@@ -214,6 +218,29 @@ pub type CleanupObj<'tcx> = Box<Cleanup<'tcx>+'tcx>;
 pub enum ScopeId {
     AstScope(ast::NodeId),
     CustomScope(CustomScopeIndex)
+}
+
+#[derive(Copy, Clone, Debug)]
+pub struct DropHint<K>(pub ast::NodeId, pub K);
+
+pub type DropHintDatum<'tcx> = DropHint<Datum<'tcx, Lvalue>>;
+pub type DropHintValue = DropHint<ValueRef>;
+
+impl<K> DropHint<K> {
+    pub fn new(id: ast::NodeId, k: K) -> DropHint<K> { DropHint(id, k) }
+}
+
+impl DropHint<ValueRef> {
+    pub fn value(&self) -> ValueRef { self.1 }
+}
+
+pub trait DropHintMethods {
+    type ValueKind;
+    fn to_value(&self) -> Self::ValueKind;
+}
+impl<'tcx> DropHintMethods for DropHintDatum<'tcx> {
+    type ValueKind = DropHintValue;
+    fn to_value(&self) -> DropHintValue { DropHint(self.0, self.1.val) }
 }
 
 impl<'blk, 'tcx> CleanupMethods<'blk, 'tcx> for FunctionContext<'blk, 'tcx> {
@@ -233,18 +260,16 @@ impl<'blk, 'tcx> CleanupMethods<'blk, 'tcx> for FunctionContext<'blk, 'tcx> {
         // now we just say that if there is already an AST scope on the stack,
         // this new AST scope had better be its immediate child.
         let top_scope = self.top_ast_scope();
+        let region_maps = &self.ccx.tcx().region_maps;
         if top_scope.is_some() {
-            assert!((self.ccx
-                     .tcx()
-                     .region_maps
-                     .opt_encl_scope(region::CodeExtent::from_node_id(debug_loc.id))
-                     .map(|s|s.node_id()) == top_scope)
+            assert!((region_maps
+                     .opt_encl_scope(region_maps.node_extent(debug_loc.id))
+                     .map(|s|s.node_id(region_maps)) == top_scope)
                     ||
-                    (self.ccx
-                     .tcx()
-                     .region_maps
-                     .opt_encl_scope(region::CodeExtent::DestructionScope(debug_loc.id))
-                     .map(|s|s.node_id()) == top_scope));
+                    (region_maps
+                     .opt_encl_scope(region_maps.lookup_code_extent(
+                         region::CodeExtentData::DestructionScope(debug_loc.id)))
+                     .map(|s|s.node_id(region_maps)) == top_scope));
         }
 
         self.push_scope(CleanupScope::new(AstScopeKind(debug_loc.id),
@@ -354,16 +379,17 @@ impl<'blk, 'tcx> CleanupMethods<'blk, 'tcx> for FunctionContext<'blk, 'tcx> {
         self.ccx.sess().bug("no loop scope found");
     }
 
-    /// Returns a block to branch to which will perform all pending cleanups and then
-    /// break/continue (depending on `exit`) out of the loop with id `cleanup_scope`
+    /// Returns a block to branch to which will perform all pending cleanups and
+    /// then break/continue (depending on `exit`) out of the loop with id
+    /// `cleanup_scope`
     fn normal_exit_block(&'blk self,
                          cleanup_scope: ast::NodeId,
                          exit: usize) -> BasicBlockRef {
         self.trans_cleanups_to_exit_scope(LoopExit(cleanup_scope, exit))
     }
 
-    /// Returns a block to branch to which will perform all pending cleanups and then return from
-    /// this function
+    /// Returns a block to branch to which will perform all pending cleanups and
+    /// then return from this function
     fn return_exit_block(&'blk self) -> BasicBlockRef {
         self.trans_cleanups_to_exit_scope(ReturnExit)
     }
@@ -382,25 +408,28 @@ impl<'blk, 'tcx> CleanupMethods<'blk, 'tcx> for FunctionContext<'blk, 'tcx> {
         self.schedule_clean(cleanup_scope, drop as CleanupObj);
     }
 
-    /// Schedules a (deep) drop of `val`, which is a pointer to an instance of `ty`
+    /// Schedules a (deep) drop of `val`, which is a pointer to an instance of
+    /// `ty`
     fn schedule_drop_mem(&self,
                          cleanup_scope: ScopeId,
                          val: ValueRef,
-                         ty: Ty<'tcx>) {
+                         ty: Ty<'tcx>,
+                         drop_hint: Option<DropHintDatum<'tcx>>) {
         if !self.type_needs_drop(ty) { return; }
+        let drop_hint = drop_hint.map(|hint|hint.to_value());
         let drop = box DropValue {
             is_immediate: false,
-            must_unwind: common::type_needs_unwind_cleanup(self.ccx, ty),
             val: val,
             ty: ty,
             fill_on_drop: false,
             skip_dtor: false,
+            drop_hint: drop_hint,
         };
 
-        debug!("schedule_drop_mem({:?}, val={}, ty={}) fill_on_drop={} skip_dtor={}",
+        debug!("schedule_drop_mem({:?}, val={}, ty={:?}) fill_on_drop={} skip_dtor={}",
                cleanup_scope,
                self.ccx.tn().val_to_string(val),
-               ty.repr(self.ccx.tcx()),
+               ty,
                drop.fill_on_drop,
                drop.skip_dtor);
 
@@ -411,24 +440,28 @@ impl<'blk, 'tcx> CleanupMethods<'blk, 'tcx> for FunctionContext<'blk, 'tcx> {
     fn schedule_drop_and_fill_mem(&self,
                                   cleanup_scope: ScopeId,
                                   val: ValueRef,
-                                  ty: Ty<'tcx>) {
+                                  ty: Ty<'tcx>,
+                                  drop_hint: Option<DropHintDatum<'tcx>>) {
         if !self.type_needs_drop(ty) { return; }
 
+        let drop_hint = drop_hint.map(|datum|datum.to_value());
         let drop = box DropValue {
             is_immediate: false,
-            must_unwind: common::type_needs_unwind_cleanup(self.ccx, ty),
             val: val,
             ty: ty,
             fill_on_drop: true,
             skip_dtor: false,
+            drop_hint: drop_hint,
         };
 
-        debug!("schedule_drop_and_fill_mem({:?}, val={}, ty={}, fill_on_drop={}, skip_dtor={})",
+        debug!("schedule_drop_and_fill_mem({:?}, val={}, ty={:?},
+                fill_on_drop={}, skip_dtor={}, has_drop_hint={})",
                cleanup_scope,
                self.ccx.tn().val_to_string(val),
-               ty.repr(self.ccx.tcx()),
+               ty,
                drop.fill_on_drop,
-               drop.skip_dtor);
+               drop.skip_dtor,
+               drop_hint.is_some());
 
         self.schedule_clean(cleanup_scope, drop as CleanupObj);
     }
@@ -448,17 +481,17 @@ impl<'blk, 'tcx> CleanupMethods<'blk, 'tcx> for FunctionContext<'blk, 'tcx> {
 
         let drop = box DropValue {
             is_immediate: false,
-            must_unwind: common::type_needs_unwind_cleanup(self.ccx, ty),
             val: val,
             ty: ty,
             fill_on_drop: false,
             skip_dtor: true,
+            drop_hint: None,
         };
 
-        debug!("schedule_drop_adt_contents({:?}, val={}, ty={}) fill_on_drop={} skip_dtor={}",
+        debug!("schedule_drop_adt_contents({:?}, val={}, ty={:?}) fill_on_drop={} skip_dtor={}",
                cleanup_scope,
                self.ccx.tn().val_to_string(val),
-               ty.repr(self.ccx.tcx()),
+               ty,
                drop.fill_on_drop,
                drop.skip_dtor);
 
@@ -472,19 +505,19 @@ impl<'blk, 'tcx> CleanupMethods<'blk, 'tcx> for FunctionContext<'blk, 'tcx> {
                                ty: Ty<'tcx>) {
 
         if !self.type_needs_drop(ty) { return; }
-        let drop = box DropValue {
+        let drop = Box::new(DropValue {
             is_immediate: true,
-            must_unwind: common::type_needs_unwind_cleanup(self.ccx, ty),
             val: val,
             ty: ty,
             fill_on_drop: false,
             skip_dtor: false,
-        };
+            drop_hint: None,
+        });
 
         debug!("schedule_drop_immediate({:?}, val={}, ty={:?}) fill_on_drop={} skip_dtor={}",
                cleanup_scope,
                self.ccx.tn().val_to_string(val),
-               ty.repr(self.ccx.tcx()),
+               ty,
                drop.fill_on_drop,
                drop.skip_dtor);
 
@@ -528,7 +561,7 @@ impl<'blk, 'tcx> CleanupMethods<'blk, 'tcx> for FunctionContext<'blk, 'tcx> {
         for scope in self.scopes.borrow_mut().iter_mut().rev() {
             if scope.kind.is_ast_with_id(cleanup_scope) {
                 scope.cleanups.push(cleanup);
-                scope.clear_cached_exits();
+                scope.cached_landing_pad = None;
                 return;
             } else {
                 // will be adding a cleanup to some enclosing scope
@@ -553,7 +586,7 @@ impl<'blk, 'tcx> CleanupMethods<'blk, 'tcx> for FunctionContext<'blk, 'tcx> {
         let mut scopes = self.scopes.borrow_mut();
         let scope = &mut (*scopes)[custom_scope.index];
         scope.cleanups.push(cleanup);
-        scope.clear_cached_exits();
+        scope.cached_landing_pad = None;
     }
 
     /// Returns true if there are pending cleanups that should execute on panic.
@@ -561,8 +594,9 @@ impl<'blk, 'tcx> CleanupMethods<'blk, 'tcx> for FunctionContext<'blk, 'tcx> {
         self.scopes.borrow().iter().rev().any(|s| s.needs_invoke())
     }
 
-    /// Returns a basic block to branch to in the event of a panic. This block will run the panic
-    /// cleanups and eventually invoke the LLVM `Resume` instruction.
+    /// Returns a basic block to branch to in the event of a panic. This block
+    /// will run the panic cleanups and eventually resume the exception that
+    /// caused the landing pad to be run.
     fn get_landing_pad(&'blk self) -> BasicBlockRef {
         let _icx = base::push_ctxt("get_landing_pad");
 
@@ -658,9 +692,10 @@ impl<'blk, 'tcx> CleanupHelperMethods<'blk, 'tcx> for FunctionContext<'blk, 'tcx
         f(self.scopes.borrow().last().unwrap())
     }
 
-    /// Used when the caller wishes to jump to an early exit, such as a return, break, continue, or
-    /// unwind. This function will generate all cleanups between the top of the stack and the exit
-    /// `label` and return a basic block that the caller can branch to.
+    /// Used when the caller wishes to jump to an early exit, such as a return,
+    /// break, continue, or unwind. This function will generate all cleanups
+    /// between the top of the stack and the exit `label` and return a basic
+    /// block that the caller can branch to.
     ///
     /// For example, if the current stack of cleanups were as follows:
     ///
@@ -671,15 +706,15 @@ impl<'blk, 'tcx> CleanupHelperMethods<'blk, 'tcx> for FunctionContext<'blk, 'tcx
     ///      Custom 2
     ///      AST 24
     ///
-    /// and the `label` specifies a break from `Loop 23`, then this function would generate a
-    /// series of basic blocks as follows:
+    /// and the `label` specifies a break from `Loop 23`, then this function
+    /// would generate a series of basic blocks as follows:
     ///
     ///      Cleanup(AST 24) -> Cleanup(Custom 2) -> break_blk
     ///
-    /// where `break_blk` is the block specified in `Loop 23` as the target for breaks. The return
-    /// value would be the first basic block in that sequence (`Cleanup(AST 24)`). The caller could
-    /// then branch to `Cleanup(AST 24)` and it will perform all cleanups and finally branch to the
-    /// `break_blk`.
+    /// where `break_blk` is the block specified in `Loop 23` as the target for
+    /// breaks. The return value would be the first basic block in that sequence
+    /// (`Cleanup(AST 24)`). The caller could then branch to `Cleanup(AST 24)`
+    /// and it will perform all cleanups and finally branch to the `break_blk`.
     fn trans_cleanups_to_exit_scope(&'blk self,
                                     label: EarlyExitLabel)
                                     -> BasicBlockRef {
@@ -689,6 +724,7 @@ impl<'blk, 'tcx> CleanupHelperMethods<'blk, 'tcx> for FunctionContext<'blk, 'tcx
         let orig_scopes_len = self.scopes_len();
         let mut prev_llbb;
         let mut popped_scopes = vec!();
+        let mut skip = 0;
 
         // First we pop off all the cleanup stacks that are
         // traversed until the exit is reached, pushing them
@@ -701,20 +737,30 @@ impl<'blk, 'tcx> CleanupHelperMethods<'blk, 'tcx> for FunctionContext<'blk, 'tcx
         loop {
             if self.scopes_len() == 0 {
                 match label {
-                    UnwindExit => {
-                        // Generate a block that will `Resume`.
-                        let prev_bcx = self.new_block(true, "resume", None);
-                        let personality = self.personality.get().expect(
-                            "create_landing_pad() should have set this");
-                        build::Resume(prev_bcx,
-                                      build::Load(prev_bcx, personality));
-                        prev_llbb = prev_bcx.llbb;
+                    UnwindExit(val) => {
+                        // Generate a block that will resume unwinding to the
+                        // calling function
+                        let bcx = self.new_block("resume", None);
+                        match val {
+                            UnwindKind::LandingPad => {
+                                let addr = self.landingpad_alloca.get()
+                                               .unwrap();
+                                let lp = build::Load(bcx, addr);
+                                base::call_lifetime_end(bcx, addr);
+                                base::trans_unwind_resume(bcx, lp);
+                            }
+                            UnwindKind::CleanupPad(_) => {
+                                let pad = build::CleanupPad(bcx, None, &[]);
+                                build::CleanupRet(bcx, pad, None);
+                            }
+                        }
+                        prev_llbb = bcx.llbb;
                         break;
                     }
 
                     ReturnExit => {
                         prev_llbb = self.get_llreturn();
-                        break;
+                        break
                     }
 
                     LoopExit(id, _) => {
@@ -725,34 +771,32 @@ impl<'blk, 'tcx> CleanupHelperMethods<'blk, 'tcx> for FunctionContext<'blk, 'tcx
                 }
             }
 
+            // Pop off the scope, since we may be generating
+            // unwinding code for it.
+            let top_scope = self.pop_scope();
+            let cached_exit = top_scope.cached_early_exit(label);
+            popped_scopes.push(top_scope);
+
             // Check if we have already cached the unwinding of this
             // scope for this label. If so, we can stop popping scopes
             // and branch to the cached label, since it contains the
             // cleanups for any subsequent scopes.
-            match self.top_scope(|s| s.cached_early_exit(label)) {
-                Some(cleanup_block) => {
-                    prev_llbb = cleanup_block;
-                    break;
-                }
-                None => { }
+            if let Some((exit, last_cleanup)) = cached_exit {
+                prev_llbb = exit;
+                skip = last_cleanup;
+                break;
             }
 
-            // Pop off the scope, since we will be generating
-            // unwinding code for it. If we are searching for a loop exit,
+            // If we are searching for a loop exit,
             // and this scope is that loop, then stop popping and set
             // `prev_llbb` to the appropriate exit block from the loop.
-            popped_scopes.push(self.pop_scope());
             let scope = popped_scopes.last().unwrap();
             match label {
-                UnwindExit | ReturnExit => { }
+                UnwindExit(..) | ReturnExit => { }
                 LoopExit(id, exit) => {
-                    match scope.kind.early_exit_block(id, exit) {
-                        Some(exitllbb) => {
-                            prev_llbb = exitllbb;
-                            break;
-                        }
-
-                        None => { }
+                    if let Some(exit) = scope.kind.early_exit_block(id, exit) {
+                        prev_llbb = exit;
+                        break
                     }
                 }
             }
@@ -781,31 +825,24 @@ impl<'blk, 'tcx> CleanupHelperMethods<'blk, 'tcx> for FunctionContext<'blk, 'tcx
         //
         // At this point, `popped_scopes` is empty, and so the final block
         // that we return to the user is `Cleanup(AST 24)`.
-        while !popped_scopes.is_empty() {
-            let mut scope = popped_scopes.pop().unwrap();
-
-            if scope.cleanups.iter().any(|c| cleanup_is_suitable_for(&**c, label))
-            {
+        while let Some(mut scope) = popped_scopes.pop() {
+            if !scope.cleanups.is_empty() {
                 let name = scope.block_name("clean");
                 debug!("generating cleanups for {}", name);
-                let bcx_in = self.new_block(label.is_unwind(),
-                                            &name[..],
-                                            None);
-                let mut bcx_out = bcx_in;
-                for cleanup in scope.cleanups.iter().rev() {
-                    if cleanup_is_suitable_for(&**cleanup, label) {
-                        bcx_out = cleanup.trans(bcx_out,
-                                                scope.debug_loc);
-                    }
-                }
-                build::Br(bcx_out, prev_llbb, DebugLoc::None);
-                prev_llbb = bcx_in.llbb;
-            } else {
-                debug!("no suitable cleanups in {}",
-                       scope.block_name("clean"));
-            }
 
-            scope.add_cached_early_exit(label, prev_llbb);
+                let bcx_in = self.new_block(&name[..], None);
+                let exit_label = label.start(bcx_in);
+                let mut bcx_out = bcx_in;
+                let len = scope.cleanups.len();
+                for cleanup in scope.cleanups.iter().rev().take(len - skip) {
+                    bcx_out = cleanup.trans(bcx_out, scope.debug_loc);
+                }
+                skip = 0;
+                exit_label.branch(bcx_out, prev_llbb);
+                prev_llbb = bcx_in.llbb;
+
+                scope.add_cached_early_exit(exit_label, prev_llbb, len);
+            }
             self.push_scope(scope);
         }
 
@@ -815,14 +852,14 @@ impl<'blk, 'tcx> CleanupHelperMethods<'blk, 'tcx> for FunctionContext<'blk, 'tcx
         prev_llbb
     }
 
-    /// Creates a landing pad for the top scope, if one does not exist.  The landing pad will
-    /// perform all cleanups necessary for an unwind and then `resume` to continue error
-    /// propagation:
+    /// Creates a landing pad for the top scope, if one does not exist.  The
+    /// landing pad will perform all cleanups necessary for an unwind and then
+    /// `resume` to continue error propagation:
     ///
     ///     landing_pad -> ... cleanups ... -> [resume]
     ///
-    /// (The cleanups and resume instruction are created by `trans_cleanups_to_exit_scope()`, not
-    /// in this function itself.)
+    /// (The cleanups and resume instruction are created by
+    /// `trans_cleanups_to_exit_scope()`, not in this function itself.)
     fn get_or_create_landing_pad(&'blk self) -> BasicBlockRef {
         let pad_bcx;
 
@@ -833,72 +870,58 @@ impl<'blk, 'tcx> CleanupHelperMethods<'blk, 'tcx> for FunctionContext<'blk, 'tcx
             let mut scopes = self.scopes.borrow_mut();
             let last_scope = scopes.last_mut().unwrap();
             match last_scope.cached_landing_pad {
-                Some(llbb) => { return llbb; }
+                Some(llbb) => return llbb,
                 None => {
                     let name = last_scope.block_name("unwind");
-                    pad_bcx = self.new_block(true, &name[..], None);
+                    pad_bcx = self.new_block(&name[..], None);
                     last_scope.cached_landing_pad = Some(pad_bcx.llbb);
-                }
-            }
-        }
-
-        // The landing pad return type (the type being propagated). Not sure what
-        // this represents but it's determined by the personality function and
-        // this is what the EH proposal example uses.
-        let llretty = Type::struct_(self.ccx,
-                                    &[Type::i8p(self.ccx), Type::i32(self.ccx)],
-                                    false);
-
-        // The exception handling personality function.
-        //
-        // If our compilation unit has the `eh_personality` lang item somewhere
-        // within it, then we just need to translate that. Otherwise, we're
-        // building an rlib which will depend on some upstream implementation of
-        // this function, so we just codegen a generic reference to it. We don't
-        // specify any of the types for the function, we just make it a symbol
-        // that LLVM can later use.
-        let llpersonality = match pad_bcx.tcx().lang_items.eh_personality() {
-            Some(def_id) => {
-                callee::trans_fn_ref(pad_bcx.ccx(), def_id, ExprId(0),
-                                     pad_bcx.fcx.param_substs).val
-            }
-            None => {
-                let mut personality = self.ccx.eh_personality().borrow_mut();
-                match *personality {
-                    Some(llpersonality) => llpersonality,
-                    None => {
-                        let fty = Type::variadic_func(&[], &Type::i32(self.ccx));
-                        let f = declare::declare_cfn(self.ccx, "rust_eh_personality", fty,
-                                                     self.ccx.tcx().types.i32);
-                        *personality = Some(f);
-                        f
-                    }
                 }
             }
         };
 
-        // The only landing pad clause will be 'cleanup'
-        let llretval = build::LandingPad(pad_bcx, llretty, llpersonality, 1);
+        let llpersonality = pad_bcx.fcx.eh_personality();
 
-        // The landing pad block is a cleanup
-        build::SetCleanup(pad_bcx, llretval);
+        let val = if base::wants_msvc_seh(self.ccx.sess()) {
+            // A cleanup pad requires a personality function to be specified, so
+            // we do that here explicitly (happens implicitly below through
+            // creation of the landingpad instruction). We then create a
+            // cleanuppad instruction which has no filters to run cleanup on all
+            // exceptions.
+            build::SetPersonalityFn(pad_bcx, llpersonality);
+            let llretval = build::CleanupPad(pad_bcx, None, &[]);
+            UnwindKind::CleanupPad(llretval)
+        } else {
+            // The landing pad return type (the type being propagated). Not sure
+            // what this represents but it's determined by the personality
+            // function and this is what the EH proposal example uses.
+            let llretty = Type::struct_(self.ccx,
+                                        &[Type::i8p(self.ccx), Type::i32(self.ccx)],
+                                        false);
 
-        // We store the retval in a function-central alloca, so that calls to
-        // Resume can find it.
-        match self.personality.get() {
-            Some(addr) => {
-                build::Store(pad_bcx, llretval, addr);
-            }
-            None => {
-                let addr = base::alloca(pad_bcx, common::val_ty(llretval), "");
-                self.personality.set(Some(addr));
-                build::Store(pad_bcx, llretval, addr);
-            }
-        }
+            // The only landing pad clause will be 'cleanup'
+            let llretval = build::LandingPad(pad_bcx, llretty, llpersonality, 1);
+
+            // The landing pad block is a cleanup
+            build::SetCleanup(pad_bcx, llretval);
+
+            let addr = match self.landingpad_alloca.get() {
+                Some(addr) => addr,
+                None => {
+                    let addr = base::alloca(pad_bcx, common::val_ty(llretval),
+                                            "");
+                    base::call_lifetime_start(pad_bcx, addr);
+                    self.landingpad_alloca.set(Some(addr));
+                    addr
+                }
+            };
+            build::Store(pad_bcx, llretval, addr);
+            UnwindKind::LandingPad
+        };
 
         // Generate the cleanup block and branch to it.
-        let cleanup_llbb = self.trans_cleanups_to_exit_scope(UnwindExit);
-        build::Br(pad_bcx, cleanup_llbb, DebugLoc::None);
+        let label = UnwindExit(val);
+        let cleanup_llbb = self.trans_cleanups_to_exit_scope(label);
+        label.branch(pad_bcx, cleanup_llbb);
 
         return pad_bcx.llbb;
     }
@@ -924,18 +947,20 @@ impl<'blk, 'tcx> CleanupScope<'blk, 'tcx> {
 
     fn cached_early_exit(&self,
                          label: EarlyExitLabel)
-                         -> Option<BasicBlockRef> {
-        self.cached_early_exits.iter().
+                         -> Option<(BasicBlockRef, usize)> {
+        self.cached_early_exits.iter().rev().
             find(|e| e.label == label).
-            map(|e| e.cleanup_block)
+            map(|e| (e.cleanup_block, e.last_cleanup))
     }
 
     fn add_cached_early_exit(&mut self,
                              label: EarlyExitLabel,
-                             blk: BasicBlockRef) {
+                             blk: BasicBlockRef,
+                             last_cleanup: usize) {
         self.cached_early_exits.push(
             CachedEarlyExit { label: label,
-                              cleanup_block: blk });
+                              cleanup_block: blk,
+                              last_cleanup: last_cleanup});
     }
 
     /// True if this scope has cleanups that need unwinding
@@ -954,8 +979,15 @@ impl<'blk, 'tcx> CleanupScope<'blk, 'tcx> {
         }
     }
 
+    /// Manipulate cleanup scope for call arguments. Conceptually, each
+    /// argument to a call is an lvalue, and performing the call moves each
+    /// of the arguments into a new rvalue (which gets cleaned up by the
+    /// callee). As an optimization, instead of actually performing all of
+    /// those moves, trans just manipulates the cleanup scope to obtain the
+    /// same effect.
     pub fn drop_non_lifetime_clean(&mut self) {
         self.cleanups.retain(|c| c.is_lifetime_end());
+        self.clear_cached_exits();
     }
 }
 
@@ -993,10 +1025,53 @@ impl<'blk, 'tcx> CleanupScopeKind<'blk, 'tcx> {
 }
 
 impl EarlyExitLabel {
-    fn is_unwind(&self) -> bool {
+    /// Generates a branch going from `from_bcx` to `to_llbb` where `self` is
+    /// the exit label attached to the start of `from_bcx`.
+    ///
+    /// Transitions from an exit label to other exit labels depend on the type
+    /// of label. For example with MSVC exceptions unwind exit labels will use
+    /// the `cleanupret` instruction instead of the `br` instruction.
+    fn branch(&self, from_bcx: Block, to_llbb: BasicBlockRef) {
+        if let UnwindExit(UnwindKind::CleanupPad(pad)) = *self {
+            build::CleanupRet(from_bcx, pad, Some(to_llbb));
+        } else {
+            build::Br(from_bcx, to_llbb, DebugLoc::None);
+        }
+    }
+
+    /// Generates the necessary instructions at the start of `bcx` to prepare
+    /// for the same kind of early exit label that `self` is.
+    ///
+    /// This function will appropriately configure `bcx` based on the kind of
+    /// label this is. For UnwindExit labels, the `lpad` field of the block will
+    /// be set to `Some`, and for MSVC exceptions this function will generate a
+    /// `cleanuppad` instruction at the start of the block so it may be jumped
+    /// to in the future (e.g. so this block can be cached as an early exit).
+    ///
+    /// Returns a new label which will can be used to cache `bcx` in the list of
+    /// early exits.
+    fn start(&self, bcx: Block) -> EarlyExitLabel {
         match *self {
-            UnwindExit => true,
-            _ => false
+            UnwindExit(UnwindKind::CleanupPad(..)) => {
+                let pad = build::CleanupPad(bcx, None, &[]);
+                bcx.lpad.set(Some(bcx.fcx.lpad_arena.alloc(LandingPad::msvc(pad))));
+                UnwindExit(UnwindKind::CleanupPad(pad))
+            }
+            UnwindExit(UnwindKind::LandingPad) => {
+                bcx.lpad.set(Some(bcx.fcx.lpad_arena.alloc(LandingPad::gnu())));
+                *self
+            }
+            label => label,
+        }
+    }
+}
+
+impl PartialEq for UnwindKind {
+    fn eq(&self, val: &UnwindKind) -> bool {
+        match (*self, *val) {
+            (UnwindKind::LandingPad, UnwindKind::LandingPad) |
+            (UnwindKind::CleanupPad(..), UnwindKind::CleanupPad(..)) => true,
+            _ => false,
         }
     }
 }
@@ -1007,20 +1082,16 @@ impl EarlyExitLabel {
 #[derive(Copy, Clone)]
 pub struct DropValue<'tcx> {
     is_immediate: bool,
-    must_unwind: bool,
     val: ValueRef,
     ty: Ty<'tcx>,
     fill_on_drop: bool,
     skip_dtor: bool,
+    drop_hint: Option<DropHintValue>,
 }
 
 impl<'tcx> Cleanup<'tcx> for DropValue<'tcx> {
     fn must_unwind(&self) -> bool {
-        self.must_unwind
-    }
-
-    fn clean_on_unwind(&self) -> bool {
-        self.must_unwind
+        true
     }
 
     fn is_lifetime_end(&self) -> bool {
@@ -1040,7 +1111,7 @@ impl<'tcx> Cleanup<'tcx> for DropValue<'tcx> {
         let bcx = if self.is_immediate {
             glue::drop_ty_immediate(bcx, self.val, self.ty, debug_loc, self.skip_dtor)
         } else {
-            glue::drop_ty_core(bcx, self.val, self.ty, debug_loc, self.skip_dtor)
+            glue::drop_ty_core(bcx, self.val, self.ty, debug_loc, self.skip_dtor, self.drop_hint)
         };
         if self.fill_on_drop {
             base::drop_done_fill_mem(bcx, self.val, self.ty);
@@ -1063,10 +1134,6 @@ pub struct FreeValue<'tcx> {
 
 impl<'tcx> Cleanup<'tcx> for FreeValue<'tcx> {
     fn must_unwind(&self) -> bool {
-        true
-    }
-
-    fn clean_on_unwind(&self) -> bool {
         true
     }
 
@@ -1099,10 +1166,6 @@ impl<'tcx> Cleanup<'tcx> for LifetimeEnd {
         false
     }
 
-    fn clean_on_unwind(&self) -> bool {
-        true
-    }
-
     fn is_lifetime_end(&self) -> bool {
         true
     }
@@ -1122,7 +1185,7 @@ pub fn temporary_scope(tcx: &ty::ctxt,
                        -> ScopeId {
     match tcx.region_maps.temporary_scope(id) {
         Some(scope) => {
-            let r = AstScope(scope.node_id());
+            let r = AstScope(scope.node_id(&tcx.region_maps));
             debug!("temporary_scope({}) = {:?}", id, r);
             r
         }
@@ -1136,14 +1199,9 @@ pub fn temporary_scope(tcx: &ty::ctxt,
 pub fn var_scope(tcx: &ty::ctxt,
                  id: ast::NodeId)
                  -> ScopeId {
-    let r = AstScope(tcx.region_maps.var_scope(id).node_id());
+    let r = AstScope(tcx.region_maps.var_scope(id).node_id(&tcx.region_maps));
     debug!("var_scope({}) = {:?}", id, r);
     r
-}
-
-fn cleanup_is_suitable_for(c: &Cleanup,
-                           label: EarlyExitLabel) -> bool {
-    !label.is_unwind() || c.clean_on_unwind()
 }
 
 ///////////////////////////////////////////////////////////////////////////
@@ -1181,11 +1239,13 @@ pub trait CleanupMethods<'blk, 'tcx> {
     fn schedule_drop_mem(&self,
                          cleanup_scope: ScopeId,
                          val: ValueRef,
-                         ty: Ty<'tcx>);
+                         ty: Ty<'tcx>,
+                         drop_hint: Option<DropHintDatum<'tcx>>);
     fn schedule_drop_and_fill_mem(&self,
                                   cleanup_scope: ScopeId,
                                   val: ValueRef,
-                                  ty: Ty<'tcx>);
+                                  ty: Ty<'tcx>,
+                                  drop_hint: Option<DropHintDatum<'tcx>>);
     fn schedule_drop_adt_contents(&self,
                                   cleanup_scope: ScopeId,
                                   val: ValueRef,

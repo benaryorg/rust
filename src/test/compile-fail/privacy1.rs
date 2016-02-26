@@ -8,8 +8,8 @@
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
 
-#![feature(lang_items, start, no_std)]
-#![no_std] // makes debugging this test *a lot* easier (during resolve)
+#![feature(lang_items, start, no_core)]
+#![no_core] // makes debugging this test *a lot* easier (during resolve)
 
 #[lang="sized"]
 pub trait Sized {}
@@ -129,12 +129,17 @@ mod foo {
         ::bar::baz::foo(); //~ ERROR: function `foo` is inaccessible
                            //~^ NOTE: module `baz` is private
         ::bar::baz::bar(); //~ ERROR: function `bar` is inaccessible
+                           //~^ NOTE: module `baz` is private
     }
 
     fn test2() {
         use bar::baz::{foo, bar};
         //~^ ERROR: function `foo` is inaccessible
-        //~^^ ERROR: function `bar` is inaccessible
+        //~| NOTE: module `baz` is private
+        //~| ERROR: function `bar` is inaccessible
+        //~| NOTE: module `baz` is private
+
+
         foo();
         bar();
     }
@@ -164,7 +169,7 @@ pub mod mytest {
     // Even though the inner `A` struct is a publicly exported item (usable from
     // external crates through `foo::foo`, it should not be accessible through
     // its definition path (which has the private `i` module).
-    use self::foo::i::A; //~ ERROR: type `A` is inaccessible
+    use self::foo::i::A; //~ ERROR: struct `A` is inaccessible
                          //~^ NOTE: module `i` is private
 
     pub mod foo {

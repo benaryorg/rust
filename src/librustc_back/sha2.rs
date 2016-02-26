@@ -12,8 +12,6 @@
 //! use. This implementation is not intended for external use or for any use where security is
 //! important.
 
-use std::iter::repeat;
-use std::slice::bytes::{MutableByteVector, copy_memory};
 use serialize::hex::ToHex;
 
 /// Write a u32 into a vector, which must be 4 bytes long. The value is written in big-endian
@@ -135,16 +133,14 @@ impl FixedBuffer for FixedBuffer64 {
         if self.buffer_idx != 0 {
             let buffer_remaining = size - self.buffer_idx;
             if input.len() >= buffer_remaining {
-                    copy_memory(
-                        &input[..buffer_remaining],
-                        &mut self.buffer[self.buffer_idx..size]);
+                self.buffer[self.buffer_idx..size]
+                    .clone_from_slice(&input[..buffer_remaining]);
                 self.buffer_idx = 0;
                 func(&self.buffer);
                 i += buffer_remaining;
             } else {
-                copy_memory(
-                    input,
-                    &mut self.buffer[self.buffer_idx..self.buffer_idx + input.len()]);
+                self.buffer[self.buffer_idx..self.buffer_idx + input.len()]
+                    .clone_from_slice(input);
                 self.buffer_idx += input.len();
                 return;
             }
@@ -161,9 +157,7 @@ impl FixedBuffer for FixedBuffer64 {
         // data left in the input vector will be less than the buffer size and the buffer will
         // be empty.
         let input_remaining = input.len() - i;
-        copy_memory(
-            &input[i..],
-            &mut self.buffer[..input_remaining]);
+        self.buffer[..input_remaining].clone_from_slice(&input[i..]);
         self.buffer_idx += input_remaining;
     }
 
@@ -173,7 +167,9 @@ impl FixedBuffer for FixedBuffer64 {
 
     fn zero_until(&mut self, idx: usize) {
         assert!(idx >= self.buffer_idx);
-        self.buffer[self.buffer_idx..idx].set_memory(0);
+        for slot in self.buffer[self.buffer_idx..idx].iter_mut() {
+            *slot = 0;
+        }
         self.buffer_idx = idx;
     }
 
@@ -255,7 +251,7 @@ pub trait Digest {
     /// Convenience function that retrieves the result of a digest as a
     /// newly allocated vec of bytes.
     fn result_bytes(&mut self) -> Vec<u8> {
-        let mut buf: Vec<u8> = repeat(0).take((self.output_bits()+7)/8).collect();
+        let mut buf = vec![0; (self.output_bits()+7)/8];
         self.result(&mut buf);
         buf
     }
@@ -482,6 +478,7 @@ pub struct Sha256 {
 
 impl Sha256 {
     /// Construct a new instance of a SHA-256 digest.
+    /// Do not – under any circumstances – use this where timing attacks might be possible!
     pub fn new() -> Sha256 {
         Sha256 {
             engine: Engine256::new(&H256)
@@ -533,7 +530,6 @@ mod tests {
     use self::rand::Rng;
     use self::rand::isaac::IsaacRng;
     use serialize::hex::FromHex;
-    use std::iter::repeat;
     use std::u64;
     use super::{Digest, Sha256, FixedBuffer};
 
@@ -612,7 +608,7 @@ mod tests {
     /// correct.
     fn test_digest_1million_random<D: Digest>(digest: &mut D, blocksize: usize, expected: &str) {
         let total_size = 1000000;
-        let buffer: Vec<u8> = repeat('a' as u8).take(blocksize * 2).collect();
+        let buffer = vec![b'a'; blocksize * 2];
         let mut rng = IsaacRng::new_unseeded();
         let mut count = 0;
 

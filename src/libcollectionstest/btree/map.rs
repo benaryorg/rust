@@ -11,7 +11,7 @@
 use std::collections::BTreeMap;
 use std::collections::Bound::{Excluded, Included, Unbounded, self};
 use std::collections::btree_map::Entry::{Occupied, Vacant};
-use std::iter::range_inclusive;
+use std::rc::Rc;
 
 #[test]
 fn test_basic_large() {
@@ -187,7 +187,7 @@ fn test_range() {
     for i in 0..size {
         for j in i..size {
             let mut kvs = map.range(Included(&i), Included(&j)).map(|(&k, &v)| (k, v));
-            let mut pairs = range_inclusive(i, j).map(|i| (i, i));
+            let mut pairs = (i..j+1).map(|i| (i, i));
 
             for (kv, pair) in kvs.by_ref().zip(pairs.by_ref()) {
                 assert_eq!(kv, pair);
@@ -195,6 +195,34 @@ fn test_range() {
             assert_eq!(kvs.next(), None);
             assert_eq!(pairs.next(), None);
         }
+    }
+}
+
+#[test]
+fn test_borrow() {
+    // make sure these compile -- using the Borrow trait
+    {
+        let mut map = BTreeMap::new();
+        map.insert("0".to_string(), 1);
+        assert_eq!(map["0"], 1);
+    }
+
+    {
+        let mut map = BTreeMap::new();
+        map.insert(Box::new(0), 1);
+        assert_eq!(map[&0], 1);
+    }
+
+    {
+        let mut map = BTreeMap::new();
+        map.insert(Box::new([0, 1]) as Box<[i32]>, 1);
+        assert_eq!(map[&[0, 1][..]], 1);
+    }
+
+    {
+        let mut map = BTreeMap::new();
+        map.insert(Rc::new(0), 1);
+        assert_eq!(map[&0], 1);
     }
 }
 
@@ -247,6 +275,124 @@ fn test_entry(){
     }
     assert_eq!(map.get(&10).unwrap(), &1000);
     assert_eq!(map.len(), 6);
+}
+
+#[test]
+fn test_extend_ref() {
+    let mut a = BTreeMap::new();
+    a.insert(1, "one");
+    let mut b = BTreeMap::new();
+    b.insert(2, "two");
+    b.insert(3, "three");
+
+    a.extend(&b);
+
+    assert_eq!(a.len(), 3);
+    assert_eq!(a[&1], "one");
+    assert_eq!(a[&2], "two");
+    assert_eq!(a[&3], "three");
+}
+
+#[test]
+fn test_zst() {
+    let mut m = BTreeMap::new();
+    assert_eq!(m.len(), 0);
+
+    assert_eq!(m.insert((), ()), None);
+    assert_eq!(m.len(), 1);
+
+    assert_eq!(m.insert((), ()), Some(()));
+    assert_eq!(m.len(), 1);
+    assert_eq!(m.iter().count(), 1);
+
+    m.clear();
+    assert_eq!(m.len(), 0);
+
+    for _ in 0..100 {
+        m.insert((), ());
+    }
+
+    assert_eq!(m.len(), 1);
+    assert_eq!(m.iter().count(), 1);
+}
+
+// This test's only purpose is to ensure that zero-sized keys with nonsensical orderings
+// do not cause segfaults when used with zero-sized values. All other map behavior is
+// undefined.
+#[test]
+fn test_bad_zst() {
+    use std::cmp::Ordering;
+
+    struct Bad;
+
+    impl PartialEq for Bad {
+        fn eq(&self, _: &Self) -> bool { false }
+    }
+
+    impl Eq for Bad {}
+
+    impl PartialOrd for Bad {
+        fn partial_cmp(&self, _: &Self) -> Option<Ordering> { Some(Ordering::Less) }
+    }
+
+    impl Ord for Bad {
+        fn cmp(&self, _: &Self) -> Ordering { Ordering::Less }
+    }
+
+    let mut m = BTreeMap::new();
+
+    for _ in 0..100 {
+        m.insert(Bad, Bad);
+    }
+}
+
+#[test]
+fn test_clone() {
+    let mut map = BTreeMap::new();
+    let size = 100;
+    assert_eq!(map.len(), 0);
+
+    for i in 0..size {
+        assert_eq!(map.insert(i, 10*i), None);
+        assert_eq!(map.len(), i + 1);
+        assert_eq!(map, map.clone());
+    }
+
+    for i in 0..size {
+        assert_eq!(map.insert(i, 100*i), Some(10*i));
+        assert_eq!(map.len(), size);
+        assert_eq!(map, map.clone());
+    }
+
+    for i in 0..size/2 {
+        assert_eq!(map.remove(&(i*2)), Some(i*200));
+        assert_eq!(map.len(), size - i - 1);
+        assert_eq!(map, map.clone());
+    }
+
+    for i in 0..size/2 {
+        assert_eq!(map.remove(&(2*i)), None);
+        assert_eq!(map.remove(&(2*i+1)), Some(i*200 + 100));
+        assert_eq!(map.len(), size/2 - i - 1);
+        assert_eq!(map, map.clone());
+    }
+}
+
+#[test]
+#[allow(dead_code)]
+fn test_variance() {
+    use std::collections::btree_map::{Iter, IntoIter, Range, Keys, Values};
+
+    fn map_key<'new>(v: BTreeMap<&'static str, ()>) -> BTreeMap<&'new str, ()> { v }
+    fn map_val<'new>(v: BTreeMap<(), &'static str>) -> BTreeMap<(), &'new str> { v }
+    fn iter_key<'a, 'new>(v: Iter<'a, &'static str, ()>) -> Iter<'a, &'new str, ()> { v }
+    fn iter_val<'a, 'new>(v: Iter<'a, (), &'static str>) -> Iter<'a, (), &'new str> { v }
+    fn into_iter_key<'new>(v: IntoIter<&'static str, ()>) -> IntoIter<&'new str, ()> { v }
+    fn into_iter_val<'new>(v: IntoIter<(), &'static str>) -> IntoIter<(), &'new str> { v }
+    fn range_key<'a, 'new>(v: Range<'a, &'static str, ()>) -> Range<'a, &'new str, ()> { v }
+    fn range_val<'a, 'new>(v: Range<'a, (), &'static str>) -> Range<'a, (), &'new str> { v }
+    fn keys<'a, 'new>(v: Keys<'a, &'static str, ()>) -> Keys<'a, &'new str, ()> { v }
+    fn vals<'a, 'new>(v: Values<'a, (), &'static str>) -> Values<'a, (), &'new str> { v }
 }
 
 mod bench {

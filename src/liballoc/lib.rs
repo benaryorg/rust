@@ -22,9 +22,9 @@
 //!
 //! ## Boxed values
 //!
-//! The [`Box`](boxed/index.html) type is the core owned pointer type in Rust.
-//! There can only be one owner of a `Box`, and the owner can decide to mutate
-//! the contents, which live on the heap.
+//! The [`Box`](boxed/index.html) type is a smart pointer type. There can
+//! only be one owner of a `Box`, and the owner can decide to mutate the
+//! contents, which live on the heap.
 //!
 //! This type can be sent among threads efficiently as the size of a `Box` value
 //! is the same as that of a pointer. Tree-like data structures are often built
@@ -56,45 +56,53 @@
 //! The [`heap`](heap/index.html) module defines the low-level interface to the
 //! default global allocator. It is not compatible with the libc allocator API.
 
-// Do not remove on snapshot creation. Needed for bootstrap. (Issue #22364)
-#![cfg_attr(stage0, feature(custom_attribute))]
 #![crate_name = "alloc"]
-#![unstable(feature = "alloc")]
-#![feature(staged_api)]
-#![staged_api]
 #![crate_type = "rlib"]
-#![doc(html_logo_url = "http://www.rust-lang.org/logos/rust-logo-128x128-blk-v2.png",
+#![allow(unused_attributes)]
+#![unstable(feature = "alloc",
+            reason = "this library is unlikely to be stabilized in its current \
+                      form or name",
+            issue = "27783")]
+#![doc(html_logo_url = "https://www.rust-lang.org/logos/rust-logo-128x128-blk-v2.png",
        html_favicon_url = "https://doc.rust-lang.org/favicon.ico",
-       html_root_url = "http://doc.rust-lang.org/nightly/")]
-#![doc(test(no_crate_inject))]
-
-#![feature(no_std)]
+       html_root_url = "https://doc.rust-lang.org/nightly/",
+       issue_tracker_base_url = "https://github.com/rust-lang/rust/issues/",
+       test(no_crate_inject, attr(allow(unused_variables), deny(warnings))))]
 #![no_std]
+#![needs_allocator]
+#![cfg_attr(not(stage0), deny(warnings))]
+
 #![feature(allocator)]
+#![feature(box_syntax)]
+#![feature(coerce_unsized)]
+#![feature(const_fn)]
+#![feature(core_intrinsics)]
 #![feature(custom_attribute)]
+#![feature(drop_in_place)]
+#![feature(dropck_parametricity)]
 #![feature(fundamental)]
 #![feature(lang_items)]
-#![feature(box_syntax)]
+#![feature(needs_allocator)]
 #![feature(optin_builtin_traits)]
+#![feature(placement_in_syntax)]
+#![feature(shared)]
+#![feature(staged_api)]
 #![feature(unboxed_closures)]
-#![feature(unsafe_no_drop_flag, filling_drop)]
-#![feature(core)]
 #![feature(unique)]
-#![cfg_attr(test, feature(test, alloc, rustc_private))]
-#![cfg_attr(all(not(feature = "external_funcs"), not(feature = "external_crate")),
-            feature(libc))]
+#![feature(unsafe_no_drop_flag, filling_drop)]
+#![feature(unsize)]
 
-
-#[macro_use]
-extern crate core;
-
-#[cfg(all(not(feature = "external_funcs"), not(feature = "external_crate")))]
-extern crate libc;
+#![cfg_attr(not(test), feature(raw, fn_traits, placement_new_protocol))]
+#![cfg_attr(test, feature(test, rustc_private, box_heap))]
 
 // Allow testing this library
 
-#[cfg(test)] #[macro_use] extern crate std;
-#[cfg(test)] #[macro_use] extern crate log;
+#[cfg(test)]
+#[macro_use]
+extern crate std;
+#[cfg(test)]
+#[macro_use]
+extern crate log;
 
 // Heaps provided for low-level allocation strategies
 
@@ -109,33 +117,14 @@ pub mod heap;
 #[cfg(not(test))]
 pub mod boxed;
 #[cfg(test)]
-mod boxed { pub use std::boxed::{Box, HEAP}; }
+mod boxed {
+    pub use std::boxed::{Box, HEAP};
+}
 #[cfg(test)]
 mod boxed_test;
 pub mod arc;
 pub mod rc;
+pub mod raw_vec;
+pub mod oom;
 
-/// Common out-of-memory routine
-#[cold]
-#[inline(never)]
-pub fn oom() -> ! {
-    // FIXME(#14674): This really needs to do something other than just abort
-    //                here, but any printing done must be *guaranteed* to not
-    //                allocate.
-    unsafe { core::intrinsics::abort() }
-}
-
-// FIXME(#14344): When linking liballoc with libstd, this library will be linked
-//                as an rlib (it only exists as an rlib). It turns out that an
-//                optimized standard library doesn't actually use *any* symbols
-//                from this library. Everything is inlined and optimized away.
-//                This means that linkers will actually omit the object for this
-//                file, even though it may be needed in the future.
-//
-//                To get around this for now, we define a dummy symbol which
-//                will never get inlined so the stdlib can call it. The stdlib's
-//                reference to this symbol will cause this library's object file
-//                to get linked in to libstd successfully (the linker won't
-//                optimize it out).
-#[doc(hidden)]
-pub fn fixme_14344_be_sure_to_link_to_collections() {}
+pub use oom::oom;

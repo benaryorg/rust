@@ -8,6 +8,8 @@
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
 
+// ignore-emscripten no threads support
+
 // Test that if a slicing expr[..] fails, the correct cleanups happen.
 
 
@@ -28,5 +30,5 @@ fn foo() {
 
 fn main() {
     let _ = thread::spawn(move|| foo()).join();
-    unsafe { assert!(DTOR_COUNT == 2); }
+    unsafe { assert_eq!(DTOR_COUNT, 2); }
 }

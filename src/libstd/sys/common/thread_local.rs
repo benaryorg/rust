@@ -55,10 +55,8 @@
 //! ```
 
 #![allow(non_camel_case_types)]
-#![unstable(feature = "thread_local_internals")]
+#![unstable(feature = "thread_local_internals", issue = "0")]
 #![allow(dead_code)] // sys isn't exported yet
-
-use prelude::v1::*;
 
 use sync::atomic::{self, AtomicUsize, Ordering};
 
@@ -102,7 +100,7 @@ pub struct StaticKey {
 /// type is entirely safe to use.
 ///
 /// Implementations will likely, however, contain unsafe code as this type only
-/// operates on `*mut u8`, an unsafe pointer.
+/// operates on `*mut u8`, a raw pointer.
 ///
 /// # Examples
 ///
